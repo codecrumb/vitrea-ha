@@ -1,0 +1,30 @@
+name: Release
+
+# Push a tag like v1.0.0 to build and publish a release. HACS can install
+# straight from the repo contents without this, but it also gives anyone
+# who wants to install manually a ready-made zip to drop into
+# custom_components/.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Zip the integration
+        run: |
+          cd custom_components
+          zip -r ../vitrea-ha.zip vitrea
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: vitrea-ha.zip
+          generate_release_notes: true

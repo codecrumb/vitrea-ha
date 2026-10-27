@@ -1,0 +1,11 @@
+{
+  "domain": "vitrea",
+  "name": "Vitrea V-Box",
+  "version": "0.1.0",
+  "config_flow": true,
+  "iot_class": "local_push",
+  "codeowners": ["@codecrumb"],
+  "documentation": "https://github.com/codecrumb/vitrea-ha",
+  "issue_tracker": "https://github.com/codecrumb/vitrea-ha/issues",
+  "requirements": []
+}
