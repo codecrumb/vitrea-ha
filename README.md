@@ -79,6 +79,75 @@ Reachable from the integration's **Configure** button:
   skip when building entities, for any key that turns out to be a
   duplicate/ghost circuit on your particular install.
 
+## Troubleshooting
+
+**Enable debug logging first** - it makes every report far easier to
+diagnose. In `configuration.yaml`:
+
+```yaml
+logger:
+  logs:
+    custom_components.vitrea: debug
+```
+
+### "Failed to connect" when adding the integration
+
+- Check the V-Box IP and that port `11503` is reachable from Home
+  Assistant (same VLAN, or a firewall rule allowing it).
+- Check the user/password. A wrong password shows up in the log as
+  `login failed for user 'vitreaN': bad credentials`.
+- **Each `vitrea1`-`vitrea8` account allows one session at a time.** If
+  the phone app (or another HA instance) is logged in as the same
+  account, one of the two gets kicked off. Give Home Assistant its own
+  account.
+
+### The integration keeps reconnecting
+
+Log lines like `session unresponsive` or `Vitrea mobile connection
+down, reconnecting` mean the connection dropped. An occasional one is
+normal: the V-Box itself silently stops answering a mobile session every
+few minutes (measured on one install, cause unknown). The integration
+pings it every 10 seconds and replaces a dead session in the background,
+so you normally won't notice.
+
+If it happens constantly (several times a minute), the account is most
+likely being used somewhere else (see above) or the V-Box is overloaded.
+Use a dedicated account, and don't run the CLI, other scripts, or a
+second HA against the same account.
+
+### A light's state in HA is stale or wrong
+
+State normally arrives by push. A slow safety-net poll (every 5
+minutes) corrects any missed push, and logs
+`Vitrea poll corrected ...` when it fixes something. If you see that
+often, please open an issue with debug logs.
+
+### Commands feel slow, or two presses are serialized
+
+The mobile protocol only allows one request in flight at a time, so
+simultaneous commands are queued by design, not a bug. Firing many
+commands at once can make the box stop answering for a moment.
+
+### Entities are missing, misnamed, or a duplicate/ghost circuit appears
+
+- Names, rooms and types are cached after the first scan. After
+  renaming something on the box, use **Configure -> Rescan device on
+  every startup**, click **Reload**, then turn it back off.
+- To hide a duplicate or ghost circuit, add it to **Excluded keys**
+  (`node:key`, 0-indexed).
+- Startup can take a few minutes on a large install while the first
+  scan runs.
+
+### Dimmers don't dim
+
+Dimmer support is untested against real hardware (see above). Please
+open a **Dimmer test report** issue.
+
+### Reporting a problem
+
+Open an issue with your Home Assistant version, integration version,
+and the debug log lines around the problem.
+
 ## Known limitations
 
 - Dimmer brightness control is unverified (see above).
