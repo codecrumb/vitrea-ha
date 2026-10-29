@@ -19,9 +19,14 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Zip the integration
+        # HACS's zip_release extracts this archive's contents directly
+        # into custom_components/vitrea/ — so the zip must contain the
+        # files at its root, NOT a wrapping vitrea/ folder (that nests
+        # as custom_components/vitrea/vitrea/, confirmed on a real box
+        # with v0.2.1 before this fix).
         run: |
-          cd custom_components
-          zip -r ../vitrea-ha.zip vitrea
+          cd custom_components/vitrea
+          zip -r ../../vitrea-ha.zip .
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
