@@ -42,7 +42,7 @@ async def main():
     h._last_activity-=100; await h._async_keepalive_tick(None); assert h._mobile.calls==[("ts",)]
     assert h._mobile.last_ts_timeout is not None and h._mobile.last_ts_timeout<=5, h._mobile.last_ts_timeout  # short ping timeout
     h._last_activity-=100; h._mobile.fail_ping=True; recon=[]
-    h._reconnect_with_backoff=lambda: recon.append(1); 
+    h._reconnect_with_backoff=lambda *a: recon.append(1); 
     async def noref(): pass
     h._async_refresh_all_states=noref
     await h._async_keepalive_tick(None); assert recon==[1]; assert h.available is False
@@ -65,5 +65,20 @@ async def main():
         seen=[]; h._entities={(5,0):types.SimpleNamespace(_position=100,on_push_state=lambda on,r:seen.append((on,r)))}
         captured.clear(); h._schedule_verify(5,0); assert len(captured)==1
         await captured[0](None); assert seen==expect,(status,seen)
+    # reconnects are serialized: two threads that saw the same dead session -> ONE login
+    import threading
+    h=mk(); logins=[]
+    def fake_connect(): logins.append(1); h._epoch+=1
+    h._connect_mobile=fake_connect; e=h._epoch
+    ts=[threading.Thread(target=h._reconnect_with_backoff,args=(e,)) for _ in range(3)]
+    [t.start() for t in ts]; [t.join() for t in ts]; assert len(logins)==1, logins
+    # command path: short timeout first, then ONE reconnect and a patient retry (timeout=None)
+    h=mk(); seen=[]; rec=[]
+    h._reconnect_with_backoff=lambda *a: rec.append(a)
+    def send(t):
+        seen.append(t)
+        if len(seen)==1: raise RuntimeError("timeout")
+        return "ok"
+    assert h._call_cmd(send)=="ok" and seen==[hub.COMMAND_TIMEOUT,None] and len(rec)==1, (seen,rec)
     print("all hub tests passed")
 asyncio.run(main())

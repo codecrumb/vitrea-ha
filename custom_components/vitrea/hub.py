@@ -1,6 +1,7 @@
 from __future__ import annotations
 import logging
 import re
+import threading
 import time
 from datetime import timedelta
 from typing import TYPE_CHECKING
@@ -124,6 +125,12 @@ class VitreaHub:
         self._status_cache: dict[int, tuple[float, dict]] = {}
         self._meta_count = 0
         self._last_command = 0.0
+        # Two logins on one mobile account kill both sessions, so every
+        # reconnect goes through this lock; _epoch counts successful
+        # (re)connects so a thread that waited on the lock can see someone
+        # else already replaced the session and skip a second login.
+        self._connect_lock = threading.RLock()
+        self._epoch = 0
         self._verify_cancel: dict[tuple[int, int], object] = {}
         self._metadata_listeners: list = []
 
@@ -296,6 +303,7 @@ class VitreaHub:
                 if self._meta_count and self._meta_count % METADATA_RELOGIN_EVERY == 0:
                     self._connect_mobile()
                 self._meta_count += 1
+                self._last_activity = time.monotonic()
                 result = getattr(self._mobile, method)(*args)
                 time.sleep(METADATA_PACE)
                 return result
@@ -394,23 +402,25 @@ class VitreaHub:
     # Mobile protocol: persistent connection, control + live push.
     # ---------------------------------------------------------------
     def _connect_mobile(self) -> None:
-        if self._mobile is not None:
-            try:
-                self._mobile.close()
-            except Exception:
-                pass
-        d = self._data
-        m = MobileVBox(
-            host=d["host"],
-            port=d[CONF_MOBILE_PORT],
-            user=d[CONF_MOBILE_USER],
-            password=d[CONF_MOBILE_PASSWORD],
-        )
-        m.add_push_callback(self._on_push)
-        m.connect()
-        m.login()
-        self._mobile = m
-        self.available = True
+        with self._connect_lock:
+            if self._mobile is not None:
+                try:
+                    self._mobile.close()
+                except Exception:
+                    pass
+            d = self._data
+            m = MobileVBox(
+                host=d["host"],
+                port=d[CONF_MOBILE_PORT],
+                user=d[CONF_MOBILE_USER],
+                password=d[CONF_MOBILE_PASSWORD],
+            )
+            m.add_push_callback(self._on_push)
+            m.connect()
+            m.login()
+            self._mobile = m
+            self._epoch += 1
+            self.available = True
 
     def _on_push(self, push) -> None:
         # Called from the mobile client's own reader thread — hop back
@@ -429,7 +439,7 @@ class VitreaHub:
         _LOGGER.warning("Vitrea mobile connection down, reconnecting")
         self.available = False
         try:
-            await self.hass.async_add_executor_job(self._connect_mobile)
+            await self.hass.async_add_executor_job(self._reconnect_with_backoff, self._epoch)
             await self._async_refresh_all_states()
         except Exception as err:
             _LOGGER.warning("Vitrea reconnect failed: %s", err)
@@ -500,6 +510,7 @@ class VitreaHub:
             return
         if time.monotonic() - self._last_activity < KEEPALIVE_IDLE:
             return
+        epoch = self._epoch
         try:
             await self.hass.async_add_executor_job(self._mobile.get_last_change_timestamp, KEEPALIVE_TIMEOUT)
             self._last_activity = time.monotonic()
@@ -507,31 +518,55 @@ class VitreaHub:
             _LOGGER.warning("Vitrea session unresponsive (%s), reconnecting", err)
             self.available = False
             try:
-                await self.hass.async_add_executor_job(self._reconnect_with_backoff)
+                await self.hass.async_add_executor_job(self._reconnect_with_backoff, epoch)
                 await self._async_refresh_all_states()
             except Exception as err2:
                 _LOGGER.warning("Vitrea reconnect failed: %s", err2)
 
-    def _reconnect_with_backoff(self) -> None:
+    def _reconnect_with_backoff(self, seen_epoch: int | None = None) -> None:
         # The box can hold the old session slot for a few seconds after a
         # timeout, so an immediate re-login times out too (seen live as
         # "timeout waiting for response to opcode 1"). Back off.
-        for attempt in range(3):
-            time.sleep(1.0 + 2.0 * attempt)
-            try:
-                self._connect_mobile()
+        #
+        # seen_epoch is the session epoch the caller saw fail. If it has
+        # moved on by the time we get the lock, another thread already
+        # replaced the session — logging in again would kill that fresh
+        # session (seen live 2026-10-29 as a failed turn_off right after
+        # a keepalive reconnect).
+        with self._connect_lock:
+            if seen_epoch is not None and self._epoch != seen_epoch:
                 return
-            except Exception:
-                if attempt == 2:
-                    raise
+            for attempt in range(3):
+                time.sleep(1.0 + 2.0 * attempt)
+                try:
+                    self._connect_mobile()
+                    return
+                except Exception:
+                    if attempt == 2:
+                        raise
 
     def _call(self, fn):
         self._last_activity = time.monotonic()
+        epoch = self._epoch
         try:
             return fn()
         except Exception:
-            self._reconnect_with_backoff()
+            self._reconnect_with_backoff(epoch)
             return fn()
+
+    def _call_cmd(self, send):
+        """Run a command with a short first-try timeout (a dead session
+        should fail fast), then retry once after a reconnect with the
+        client's normal patient timeout — the box is often slow to answer
+        right after a fresh login.
+        """
+        self._last_activity = time.monotonic()
+        epoch = self._epoch
+        try:
+            return send(COMMAND_TIMEOUT)
+        except Exception:
+            self._reconnect_with_backoff(epoch)
+            return send(None)
 
     # ---------------------------------------------------------------
     # Commands
@@ -567,13 +602,13 @@ class VitreaHub:
 
     async def async_key_on(self, node: int, key: int, ratio: int = 0, timer: int = 0) -> None:
         await self.hass.async_add_executor_job(
-            self._call, lambda: self._mobile.set_key_status(node, self._mk(node, key), KEY_ON, ratio=ratio, timer=timer, timeout=COMMAND_TIMEOUT)
+            self._call_cmd, lambda t: self._mobile.set_key_status(node, self._mk(node, key), KEY_ON, ratio=ratio, timer=timer, timeout=t)
         )
         self._schedule_verify(node, key)
 
     async def async_key_off(self, node: int, key: int, timer: int = 0) -> None:
         await self.hass.async_add_executor_job(
-            self._call, lambda: self._mobile.set_key_status(node, self._mk(node, key), KEY_OFF, timer=timer, timeout=COMMAND_TIMEOUT)
+            self._call_cmd, lambda t: self._mobile.set_key_status(node, self._mk(node, key), KEY_OFF, timer=timer, timeout=t)
         )
         self._schedule_verify(node, key)
 
@@ -584,9 +619,9 @@ class VitreaHub:
         # direction. KEY_ON is used here only because set_key_status
         # needs *some* valid status byte.
         await self.hass.async_add_executor_job(
-            self._call,
-            lambda: self._mobile.set_key_status(
-                node, self._mk(node, key), KEY_ON, ratio=ratio, timeout=COMMAND_TIMEOUT
+            self._call_cmd,
+            lambda t: self._mobile.set_key_status(
+                node, self._mk(node, key), KEY_ON, ratio=ratio, timeout=t
             ),
         )
         self._schedule_verify(node, key)
@@ -597,9 +632,9 @@ class VitreaHub:
         # a sentinel outside the normal 0-100 range, distinct from a
         # real "closed" target (ratio=0). Confirmed live 2026-10-29.
         await self.hass.async_add_executor_job(
-            self._call,
-            lambda: self._mobile.set_key_status(
-                node, self._mk(node, key), KEY_OFF, ratio=255, timeout=COMMAND_TIMEOUT
+            self._call_cmd,
+            lambda t: self._mobile.set_key_status(
+                node, self._mk(node, key), KEY_OFF, ratio=255, timeout=t
             ),
         )
         self._schedule_verify(node, key)
