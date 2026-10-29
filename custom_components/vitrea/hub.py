@@ -416,8 +416,17 @@ class VitreaHub:
                 password=d[CONF_MOBILE_PASSWORD],
             )
             m.add_push_callback(self._on_push)
-            m.connect()
-            m.login()
+            try:
+                m.connect()
+                m.login()
+            except Exception:
+                # Don't leak a half-open session: the box allows one per
+                # account and may keep treating the account as logged in.
+                try:
+                    m.close()
+                except Exception:
+                    pass
+                raise
             self._mobile = m
             self._epoch += 1
             self.available = True
@@ -428,9 +437,19 @@ class VitreaHub:
         self.hass.loop.call_soon_threadsafe(self._dispatch_push, push)
 
     def _dispatch_push(self, push) -> None:
-        entity = self._entities.get((push.node, push.key))
-        if entity is not None:
-            entity.on_push_state(push.is_on, push.ratio)
+        self._apply_state(self._entities.get((push.node, push.key)), push)
+
+    @staticmethod
+    def _apply_state(entity, ks) -> None:
+        # An entity is registered in __init__ but only gets .hass once HA
+        # adds it; writing state before then raises ("Attribute hass is
+        # None"). async_added_to_hass reads its own initial state.
+        if entity is None or getattr(entity, "hass", None) is None:
+            return
+        try:
+            entity.on_push_state(ks.is_on, ks.ratio)
+        except Exception:
+            _LOGGER.exception("Vitrea: applying state to %s failed", getattr(entity, "entity_id", entity))
 
     async def _async_watchdog_tick(self, _now) -> None:
         alive = self._mobile is not None and self._mobile._sock is not None
@@ -489,7 +508,7 @@ class VitreaHub:
                 continue
             for (n, key), entity in list(self._entities.items()):
                 if n == node and key in snap:
-                    entity.on_push_state(snap[key].is_on, snap[key].ratio)
+                    self._apply_state(entity, snap[key])
 
     def _node_status(self, node: int, fresh: bool = False) -> dict:
         """{mobile key: KeyStatusPush} for a node. One request per node,
@@ -516,12 +535,13 @@ class VitreaHub:
             self._last_activity = time.monotonic()
         except Exception as err:
             _LOGGER.warning("Vitrea session unresponsive (%s), reconnecting", err)
-            self.available = False
             try:
                 await self.hass.async_add_executor_job(self._reconnect_with_backoff, epoch)
-                await self._async_refresh_all_states()
             except Exception as err2:
+                self.available = False
                 _LOGGER.warning("Vitrea reconnect failed: %s", err2)
+                return
+            await self._async_refresh_all_states()
 
     def _reconnect_with_backoff(self, seen_epoch: int | None = None) -> None:
         # The box can hold the old session slot for a few seconds after a
@@ -535,6 +555,12 @@ class VitreaHub:
         # a keepalive reconnect).
         with self._connect_lock:
             if seen_epoch is not None and self._epoch != seen_epoch:
+                # Another thread already replaced the session. The caller
+                # may have marked us unavailable before that happened;
+                # undo it, or keepalive/poll stay disabled and the next
+                # refresh writes every entity as unavailable (seen live
+                # 2026-10-29: 224 entities at once).
+                self.available = True
                 return
             for attempt in range(3):
                 time.sleep(1.0 + 2.0 * attempt)

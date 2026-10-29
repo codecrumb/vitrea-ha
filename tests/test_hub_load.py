@@ -45,7 +45,7 @@ async def main():
     h._reconnect_with_backoff=lambda *a: recon.append(1); 
     async def noref(): pass
     h._async_refresh_all_states=noref
-    await h._async_keepalive_tick(None); assert recon==[1]; assert h.available is False
+    await h._async_keepalive_tick(None); assert recon==[1]; assert h.available is True  # routine reconnect: stays available
     # metadata cache: first run scans+saves, second run with same stamp uses cache, changed stamp rescans
     scans=[]
     def fm(): scans.append(1); return ([{"node":1,"key":0,"mobile_key":0,"name":"A","ha_type":"light","dimmable":False,"room":""}],[{"id":0,"name":"S"}])
@@ -80,5 +80,36 @@ async def main():
         if len(seen)==1: raise RuntimeError("timeout")
         return "ok"
     assert h._call_cmd(send)=="ok" and seen==[hub.COMMAND_TIMEOUT,None] and len(rec)==1, (seen,rec)
+    # a reconnect that finds the session already replaced must not leave us unavailable (stuck-unavailable bug)
+    h=mk(); h.available=False; h._epoch=5; h._reconnect_with_backoff(4); assert h.available is True
+    # a routine keepalive reconnect doesn't flip availability; only a FAILED one does
+    for ok in (True, False):
+        h=mk(); h._last_activity-=100; h._mobile.fail_ping=True
+        def rb(*a, ok=ok):
+            if not ok: raise RuntimeError("login timeout")
+        h._reconnect_with_backoff=rb; h._async_refresh_all_states=noref
+        await h._async_keepalive_tick(None); assert h.available is ok, ok
+    # entities not yet added to hass are skipped, and one bad entity can't abort the refresh
+    seen=[]; ent=types.SimpleNamespace(hass=None,on_push_state=lambda on,r:seen.append(1))
+    hub.VitreaHub._apply_state(ent,KS(1,0,True)); assert seen==[]
+    ent.hass=object(); hub.VitreaHub._apply_state(ent,KS(1,0,True)); assert seen==[1]
+    hub.VitreaHub._apply_state(types.SimpleNamespace(hass=object(),on_push_state=lambda *a:1/0),KS(1,0,True))
+    h=mk(); got=[]
+    h._entities={(5,0):types.SimpleNamespace(hass=None,on_push_state=lambda *a:got.append("bad")),
+                 (5,1):types.SimpleNamespace(hass=object(),on_push_state=lambda *a:got.append("good"))}
+    await h._async_refresh_all_states(); assert got==["good"], got
+    # a failed login closes its socket instead of leaking it
+    closed=[]
+    class BadM:
+        def __init__(s,**k): pass
+        def add_push_callback(s,cb): pass
+        def connect(s): pass
+        def login(s): raise RuntimeError("login timeout")
+        def close(s): closed.append(1)
+    hub.MobileVBox=BadM
+    h=mk(); h._data={"host":"x",hub.CONF_MOBILE_PORT:1,hub.CONF_MOBILE_USER:"u",hub.CONF_MOBILE_PASSWORD:"p"}
+    try: h._connect_mobile(); raise SystemExit("login should have failed")
+    except RuntimeError: pass
+    assert closed==[1], closed
     print("all hub tests passed")
 asyncio.run(main())
