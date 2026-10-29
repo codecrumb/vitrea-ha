@@ -111,5 +111,20 @@ async def main():
     try: h._connect_mobile(); raise SystemExit("login should have failed")
     except RuntimeError: pass
     assert closed==[1], closed
+    # a dead-on-arrival session is discarded and reconnect retries until one answers
+    class Flaky:
+        made=[]
+        def __init__(s,**k): s.closed=False; s.n=len(Flaky.made); Flaky.made.append(s)
+        def add_push_callback(s,cb): pass
+        def connect(s): pass
+        def login(s): pass
+        def get_last_change_timestamp(s,timeout=None):
+            if s.n < 2: raise RuntimeError("dead on arrival")
+            return b"\x01"
+        def close(s): s.closed=True
+    hub.MobileVBox=Flaky
+    h=mk(); h._data={"host":"x",hub.CONF_MOBILE_PORT:1,hub.CONF_MOBILE_USER:"u",hub.CONF_MOBILE_PASSWORD:"p"}; h.available=False
+    h._reconnect_with_backoff()
+    assert h._mobile is Flaky.made[2] and Flaky.made[0].closed and Flaky.made[1].closed and h.available, [m.closed for m in Flaky.made]
     print("all hub tests passed")
 asyncio.run(main())

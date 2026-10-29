@@ -58,10 +58,18 @@ POLL_INTERVAL = timedelta(minutes=5)
 # background before a user command hits it, and use a short timeout for
 # pings and commands so a command that does hit a dead one stalls ~4 s
 # (timeout + reconnect) instead of ~11 s (10 s timeout + reconnect).
-KEEPALIVE_CHECK = timedelta(seconds=5)
-KEEPALIVE_IDLE = 10.0
+# Measured live 2026-10-30 (HA disabled, probe session alone, clean network):
+# the box drops or mutes a mobile session at random, often within ~10 s of
+# login if the client stays quiet, and even a session that is pinged every
+# 4 s dies after 30-100 s. Sessions that send real requests right after
+# login live far longer, so a new session is verified with an immediate
+# request and discarded if it is dead on arrival; pings only detect deaths.
+KEEPALIVE_CHECK = timedelta(seconds=3)
+KEEPALIVE_IDLE = 5.0
 KEEPALIVE_TIMEOUT = 3.0
 COMMAND_TIMEOUT = 3.0
+LOGIN_VERIFY_TIMEOUT = 3.0
+RECONNECT_DELAYS = (0.3, 1.0, 2.0, 4.0)
 STATUS_CACHE_TTL = 5.0
 METADATA_CACHE_VERSION = 1
 METADATA_PACE = 0.1
@@ -131,6 +139,7 @@ class VitreaHub:
         # else already replaced the session and skip a second login.
         self._connect_lock = threading.RLock()
         self._epoch = 0
+        self._session_started = time.monotonic()
         self._verify_cancel: dict[tuple[int, int], object] = {}
         self._metadata_listeners: list = []
 
@@ -419,6 +428,10 @@ class VitreaHub:
             try:
                 m.connect()
                 m.login()
+                # Dead-on-arrival check: a session that answers nothing right
+                # after login is useless, so fail the connect and let the
+                # caller retry rather than trusting it.
+                m.get_last_change_timestamp(timeout=LOGIN_VERIFY_TIMEOUT)
             except Exception:
                 # Don't leak a half-open session: the box allows one per
                 # account and may keep treating the account as logged in.
@@ -429,6 +442,7 @@ class VitreaHub:
                 raise
             self._mobile = m
             self._epoch += 1
+            self._session_started = time.monotonic()
             self.available = True
 
     def _on_push(self, push) -> None:
@@ -534,7 +548,10 @@ class VitreaHub:
             await self.hass.async_add_executor_job(self._mobile.get_last_change_timestamp, KEEPALIVE_TIMEOUT)
             self._last_activity = time.monotonic()
         except Exception as err:
-            _LOGGER.warning("Vitrea session unresponsive (%s), reconnecting", err)
+            _LOGGER.warning(
+                "Vitrea session unresponsive after %.0fs (%s), reconnecting",
+                time.monotonic() - self._session_started, err,
+            )
             try:
                 await self.hass.async_add_executor_job(self._reconnect_with_backoff, epoch)
             except Exception as err2:
@@ -562,13 +579,13 @@ class VitreaHub:
                 # 2026-10-29: 224 entities at once).
                 self.available = True
                 return
-            for attempt in range(3):
-                time.sleep(1.0 + 2.0 * attempt)
+            for attempt, delay in enumerate(RECONNECT_DELAYS):
+                time.sleep(delay)
                 try:
                     self._connect_mobile()
                     return
                 except Exception:
-                    if attempt == 2:
+                    if attempt == len(RECONNECT_DELAYS) - 1:
                         raise
 
     def _call(self, fn):
