@@ -1,5 +1,7 @@
 # Vitrea V-Box for Home Assistant
 
+> **If you can use [Vitrea's official Home Assistant integration](https://github.com/vitrea-sh/hass-vitrea), use that instead.** This project exists specifically for the case where you *can't* — see below.
+
 A Home Assistant custom integration for the Vitrea V-Box smart-home
 coordinator, built by reverse-engineering the wire protocol the
 official **Vitrea ControlPro** mobile app uses (not the admin/Control4
@@ -7,23 +9,24 @@ protocol).
 
 ## Why this exists
 
-Vitrea's own [official Home Assistant integration](https://github.com/vitrea-sh/hass-vitrea)
-talks to the V-Box over the *admin* protocol — the same channel used by
-Control4 and the installer tools. If your V-Box already has Control4
-(or anything else) occupying that admin session, the official
-integration doesn't work alongside it.
+Vitrea's own official integration talks to the V-Box over the *admin*
+protocol — the same channel used by Control4 and the installer tools.
+If your V-Box already has Control4 (or anything else) occupying that
+admin session, the official integration doesn't work alongside it.
 
 This integration instead uses the V-Box's **mobile protocol** (the one
 the phone app uses, port 11503, separate login accounts
 `vitrea1`-`vitrea8`), so it runs completely independently of whatever
-else is already talking to your box over the admin protocol.
+else is already talking to your box over the admin protocol. Use this
+only if that's your situation — otherwise the official integration is
+better supported and more complete.
 
 ## What it supports
 
 - **Lights** (on/off and dimmable — see note below)
 - **Switches**
 - **Fans** (on/off relays, no speed control)
-- **Covers / blinds** (continuous absolute position; no stop-mid-travel)
+- **Covers / blinds** (continuous absolute position, with mid-travel stop)
 - **Scenes** (your V-Box's saved scenarios)
 - Live push updates (no polling needed in the normal case), with a
   reconnect watchdog, an idle keepalive, and a slow safety-net poll to
@@ -32,8 +35,11 @@ else is already talking to your box over the admin protocol.
   time (toggle-able, see Options below)
 
 **Dimmers are implemented but unverified against real hardware** — the
-author's own installation has no dimmer-category circuits. If you have
-one and it misbehaves, please open an issue.
+author's own installation has no dimmer-category circuits, so this has
+never been exercised against a real dimmer. **If you have one, your
+testing would genuinely help** — please open an issue either way
+(works great, or something's off) so this note can eventually come
+down.
 
 ## Installing
 
@@ -75,8 +81,6 @@ Reachable from the integration's **Configure** button:
 
 ## Known limitations
 
-- Cover stop-mid-travel isn't implemented (the underlying semantics
-  were never confirmed against live hardware).
 - Dimmer brightness control is unverified (see above).
 - This is a reverse-engineered protocol client, not an officially
   supported integration. It's been run live against a real V-Box for

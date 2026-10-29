@@ -23,14 +23,18 @@ class VitreaCover(CoverEntity):
     """Continuous absolute-position blind (confirmed live 2026-10-25
     against one blind key): `ratio` is an absolute target position
     (0=closed, 100=open) the motor drives toward; the status byte
-    doesn't encode direction. No stop_cover: stop semantics were never
-    verified live, so CoverEntityFeature.STOP is deliberately not
-    advertised.
+    doesn't encode direction. stop_cover sends KEY_OFF with ratio=255
+    (a sentinel outside the normal 0-100 range), taken from the
+    official app's own decompiled CustomBlinds.doSendBlindStop and
+    confirmed live 2026-10-29.
     """
 
     _attr_should_poll = False
     _attr_supported_features = (
-        CoverEntityFeature.OPEN | CoverEntityFeature.CLOSE | CoverEntityFeature.SET_POSITION
+        CoverEntityFeature.OPEN
+        | CoverEntityFeature.CLOSE
+        | CoverEntityFeature.SET_POSITION
+        | CoverEntityFeature.STOP
     )
 
     def __init__(self, hub: VitreaHub, key: dict) -> None:
@@ -70,6 +74,9 @@ class VitreaCover(CoverEntity):
     async def async_set_cover_position(self, **kwargs: Any) -> None:
         position = kwargs[ATTR_POSITION]
         await self._hub.async_set_cover_position(self._node, self._key, position)
+
+    async def async_stop_cover(self, **kwargs: Any) -> None:
+        await self._hub.async_stop_cover(self._node, self._key)
 
     def on_push_state(self, is_on: bool, ratio: int) -> None:
         # While the motor is traveling, is_on=True and ratio reads back

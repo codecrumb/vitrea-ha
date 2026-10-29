@@ -62,7 +62,15 @@ class VitreaLight(LightEntity):
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         if self._dimmable:
-            ratio = math.ceil(kwargs.get(ATTR_BRIGHTNESS, 255) / 255 * 100)
+            if ATTR_BRIGHTNESS in kwargs:
+                ratio = math.ceil(kwargs[ATTR_BRIGHTNESS] / 255 * 100)
+            else:
+                # No explicit brightness: 254 is the official app's own
+                # "restore last/default level" sentinel for a bare
+                # toggle-on (CustomDimmers.changeState, decompiled
+                # com.vitrea.v7) — not plain 100%. Unverified against
+                # real dimmer hardware; see README's dimmer note.
+                ratio = 254
         else:
             ratio = 0
         await self._hub.async_key_on(self._node, self._key, ratio=ratio)

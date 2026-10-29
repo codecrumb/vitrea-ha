@@ -570,6 +570,16 @@ class VitreaHub:
         )
         self._last_command = time.monotonic()
 
+    async def async_stop_cover(self, node: int, key: int) -> None:
+        # From the official app's own decompiled source (CustomBlinds.
+        # doSendBlindStop): mid-travel stop is KEY_OFF with ratio=255 —
+        # a sentinel outside the normal 0-100 range, distinct from a
+        # real "closed" target (ratio=0). Confirmed live 2026-10-29.
+        await self.hass.async_add_executor_job(
+            self._call, lambda: self._mobile.set_key_status(node, self._mk(node, key), KEY_OFF, ratio=255)
+        )
+        self._last_command = time.monotonic()
+
     async def async_trigger_scenario(self, scenario_id: int) -> None:
         await self.hass.async_add_executor_job(self._call, lambda: self._mobile.trigger_scenario(scenario_id))
 
