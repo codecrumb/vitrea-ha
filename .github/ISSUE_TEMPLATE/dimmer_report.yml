@@ -1,0 +1,14 @@
+name: Dimmer test report
+description: You have a dimmer circuit - tell us if brightness control works
+labels: [dimmer]
+body:
+  - type: textarea
+    id: result
+    attributes:
+      label: Does on/off and brightness work? What doesn't?
+    validations: {required: true}
+  - type: textarea
+    id: logs
+    attributes:
+      label: Debug logs (optional)
+      render: text

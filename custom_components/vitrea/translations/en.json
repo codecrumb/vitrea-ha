@@ -1,0 +1,37 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to your Vitrea V-Box",
+        "description": "Uses the V-Box's mobile (app) protocol. Pick a mobile account slot (vitrea1-vitrea8) that no phone is currently using.",
+        "data": {
+          "host": "Host (V-Box IP address)",
+          "mobile_port": "Mobile port",
+          "mobile_user": "Mobile user (vitrea1-vitrea8)",
+          "mobile_password": "Mobile password"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Could not connect or log in. Check the IP, port, account and password, and that no other device is logged in with this account."
+    },
+    "abort": {
+      "already_configured": "This V-Box is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Vitrea V-Box options",
+        "data": {
+          "disable_metadata_cache": "Rescan device on every startup",
+          "excluded_keys": "Excluded keys"
+        },
+        "data_description": {
+          "disable_metadata_cache": "Skip the metadata cache. Turn on, click Reload, then turn off again to force a one-off rescan.",
+          "excluded_keys": "Comma-separated node:key pairs (0-indexed) to skip, e.g. 12:3,40:0"
+        }
+      }
+    }
+  }
+}
