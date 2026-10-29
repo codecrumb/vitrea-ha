@@ -24,10 +24,15 @@ better supported and more complete.
 ## What it supports
 
 - **Lights** (on/off and dimmable — see note below)
-- **Switches**
+- **Switches** (including boilers, which are timed switches — unverified)
+- **Scenario enable/disable switches** — the app's Enable/Disable
+  screen as config switches, hidden by default (enable the ones you want
+  in the entity registry)
 - **Fans** (on/off relays, no speed control)
 - **Covers / blinds** (continuous absolute position, with mid-travel stop)
-- **Scenes** (your V-Box's saved scenarios)
+- **Scenes** (your V-Box's saved scenarios, including ones the app's
+  main list omits)
+- A device per V-Box node under a "Vitrea V-Box" device
 - Live push updates (no polling needed in the normal case), with a
   reconnect watchdog, an idle keepalive, and a slow safety-net poll to
   correct any state drift from a missed push
@@ -75,6 +80,9 @@ Reachable from the integration's **Configure** button:
   install, so this is off by default; turn it on, click **Reload**,
   then turn it back off to force a one-off fresh scan (e.g. after
   renaming something on the box itself).
+- **Use V-Box rooms as areas** (off by default) — suggests each node's
+  V-Box room as its Home Assistant area when the device is first created.
+  Turn it on before the first run; HA creates any missing areas.
 - **Excluded keys** — comma-separated `node:key` pairs (0-indexed) to
   skip when building entities, for any key that turns out to be a
   duplicate/ghost circuit on your particular install.
@@ -128,6 +136,14 @@ The mobile protocol only allows one request in flight at a time, so
 simultaneous commands are queued by design, not a bug. Firing many
 commands at once can make the box stop answering for a moment.
 
+The V-Box also drops or mutes sessions at random. Commands therefore
+fail fast instead of queueing: one try, one reconnect and retry, and
+nothing older than 10 s is ever replayed. A newer command for the same
+light or blind replaces an older one still waiting, and if it cannot be
+delivered you get an error in HA instead of a late surprise. If sessions
+keep dying young the integration waits longer between logins rather than
+retrying faster.
+
 ### Entities are missing, misnamed, or a duplicate/ghost circuit appears
 
 - Names, rooms and types are cached after the first scan. After
@@ -151,6 +167,8 @@ and the debug log lines around the problem.
 ## Known limitations
 
 - Dimmer brightness control is unverified (see above).
+- Air conditioning and timer scenarios exist in the Vitrea app but are
+  not supported here.
 - This is a reverse-engineered protocol client, not an officially
   supported integration. It's been run live against a real V-Box for
   months without major issues, but Vitrea could change the protocol at

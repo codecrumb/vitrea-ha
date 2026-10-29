@@ -13,3 +13,4 @@ jobs:
         with:
           python-version: "3.12"
       - run: python3 tests/test_hub_load.py
+      - run: python3 tests/test_mobile_client.py

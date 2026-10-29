@@ -3,6 +3,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers import device_registry as dr
 
 from .const import DOMAIN
 from .hub import VitreaHub
@@ -11,12 +12,14 @@ PLATFORMS = [Platform.LIGHT, Platform.SWITCH, Platform.COVER, Platform.FAN, Plat
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    hub = VitreaHub(hass, entry.data, entry.options)
+    hub = VitreaHub(hass, entry.data, entry.options, entry.entry_id)
     try:
         await hub.async_setup()
     except Exception as err:
         raise ConfigEntryNotReady(f"Cannot reach Vitrea V-Box: {err}") from err
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = hub
+    # Parent device for the per-node devices (their via_device).
+    dr.async_get(hass).async_get_or_create(config_entry_id=entry.entry_id, **hub.hub_device_info())
     entry.async_on_unload(entry.add_update_listener(_async_options_updated))
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True

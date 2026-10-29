@@ -10,10 +10,12 @@ from .const import (
     CONF_MOBILE_PASSWORD,
     CONF_DISABLE_METADATA_CACHE,
     CONF_EXCLUDED_KEYS,
+    CONF_USE_ROOMS_AS_AREAS,
     DEFAULT_MOBILE_PORT,
     DEFAULT_MOBILE_USER,
     DEFAULT_DISABLE_METADATA_CACHE,
     DEFAULT_EXCLUDED_KEYS,
+    DEFAULT_USE_ROOMS_AS_AREAS,
 )
 from ._mobile_client import MobileVBox
 
@@ -82,6 +84,12 @@ class VitreaOptionsFlow(config_entries.OptionsFlow):
                 CONF_DISABLE_METADATA_CACHE,
                 default=self.config_entry.options.get(
                     CONF_DISABLE_METADATA_CACHE, DEFAULT_DISABLE_METADATA_CACHE
+                ),
+            ): bool,
+            vol.Required(
+                CONF_USE_ROOMS_AS_AREAS,
+                default=self.config_entry.options.get(
+                    CONF_USE_ROOMS_AS_AREAS, DEFAULT_USE_ROOMS_AS_AREAS
                 ),
             ): bool,
             vol.Optional(

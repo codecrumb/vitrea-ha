@@ -6,11 +6,12 @@ import time
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.event import async_call_later, async_track_time_interval
 from homeassistant.helpers.storage import Store
 
 from ._node_types import node_category
-from ._mobile_client import KEY_OFF, KEY_ON, MobileVBox
+from ._mobile_client import BOILER_ON_TIMER, KEY_OFF, KEY_ON, MobileVBox, MobileVBoxConnectionError
 from .const import (
     DOMAIN,
     CONF_MOBILE_PASSWORD,
@@ -18,8 +19,10 @@ from .const import (
     CONF_MOBILE_USER,
     CONF_DISABLE_METADATA_CACHE,
     CONF_EXCLUDED_KEYS,
+    CONF_USE_ROOMS_AS_AREAS,
     DEFAULT_DISABLE_METADATA_CACHE,
     DEFAULT_EXCLUDED_KEYS,
+    DEFAULT_USE_ROOMS_AS_AREAS,
 )
 
 if TYPE_CHECKING:
@@ -70,8 +73,24 @@ KEEPALIVE_TIMEOUT = 3.0
 COMMAND_TIMEOUT = 3.0
 LOGIN_VERIFY_TIMEOUT = 3.0
 RECONNECT_DELAYS = (0.3, 1.0, 2.0, 4.0)
+# When the box mutes sessions, a command used to queue behind the reconnect
+# lock (up to ~40 s) and then replay late, in order — lights toggling a
+# minute after the tap. Now a command lives COMMAND_MAX_AGE seconds at most,
+# gets one recovery attempt, is dropped if a newer command for the same key
+# was issued meanwhile, and otherwise fails with an error the user sees.
+COMMAND_MAX_AGE = 10.0
+# Never log in more often than this, whoever asks (command or background).
+LOGIN_MIN_GAP = 5.0
+# If the last few sessions died young the box is struggling: stop hammering
+# it with fresh logins. The wait before a *background* reconnect grows with
+# the number of young deaths in a row (a user command may still force one
+# login, subject to LOGIN_MIN_GAP). A session that lives LONG_SESSION
+# seconds clears the count.
+YOUNG_SESSION = 30.0
+LONG_SESSION = 60.0
+BACKOFF_STEPS = (0.0, 0.0, 5.0, 15.0, 30.0, 60.0)
 STATUS_CACHE_TTL = 5.0
-METADATA_CACHE_VERSION = 1
+METADATA_CACHE_VERSION = 2
 METADATA_PACE = 0.1
 METADATA_RELOGIN_EVERY = 60
 # Don't poll right after a command (the box serializes requests and was
@@ -101,14 +120,23 @@ def _parse_excluded_keys(raw: str) -> set[tuple[int, int]]:
     return out
 
 
+class _Superseded(Exception):
+    """A newer command for the same key replaced this one before it was sent."""
+
+
 class VitreaHub:
-    """Owns one admin-protocol metadata snapshot and one persistent
+    """Owns one mobile-protocol metadata snapshot and one persistent
     mobile-protocol connection (control + live push) for a single V-Box.
     """
 
-    def __init__(self, hass: "HomeAssistant", data: dict, options: dict | None = None) -> None:
+    def __init__(self, hass: "HomeAssistant", data: dict, options: dict | None = None,
+                 entry_id: str | None = None) -> None:
         self.hass = hass
+        self.entry_id = entry_id
         self._data = data
+        self._use_areas = (options or {}).get(
+            CONF_USE_ROOMS_AS_AREAS, DEFAULT_USE_ROOMS_AS_AREAS
+        )
         self._disable_metadata_cache = (options or {}).get(
             CONF_DISABLE_METADATA_CACHE, DEFAULT_DISABLE_METADATA_CACHE
         )
@@ -142,6 +170,16 @@ class VitreaHub:
         self._session_started = time.monotonic()
         self._verify_cancel: dict[tuple[int, int], object] = {}
         self._metadata_listeners: list = []
+        # Latest-wins bookkeeping: slot -> sequence number of the newest
+        # command issued for it (see _run_command).
+        self._cmd_seq: dict[tuple, int] = {}
+        self._young_deaths = 0
+        self._last_login = float("-inf")
+        self._bg_reconnecting = False
+        self.controller_version: str | None = None
+        # Scenario enable flags (op 66), refreshed by the slow poll.
+        self.scenario_enabled: dict[int, bool] = {}
+        self._scenario_entities: dict[int, object] = {}
 
     async def async_setup(self) -> None:
         # Mobile connect is fast (one login) — do that first so control/
@@ -382,6 +420,13 @@ class VitreaHub:
                 else:
                     ha_type = _KEY_CAT_HA.get(cat_id, "switch")
 
+                # Boiler keys are timed switches (CustomBoilers in the app):
+                # "on" must carry timer 0xFFFF. Category 15 is the admin
+                # enum's Boiler; type 21 is the app's NODE_KEY_BOILER.
+                boiler = cat_id == 15 or kp.get("type") == 21
+                if boiler:
+                    ha_type = "switch"
+
                 keys.append({
                     "node": nno,
                     # The mobile slot index is the only key index now, so
@@ -393,18 +438,52 @@ class VitreaHub:
                     "name": name,
                     "ha_type": ha_type,
                     "dimmable": dimmable,
+                    "boiler": boiler,
+                    # Recorded, not used for classification yet: the
+                    # app's ENodeKeyType (2 toggle, 3 blind, 13 toggle
+                    # sense, 20 dimmer, 21 boiler, 23 dual pole) should
+                    # match this byte, but that is unverified live.
+                    "key_type": kp.get("type"),
+                    "category": cat_id,
                     "room": room_names.get(kp["room_no"] or info["room_no"], ""),
                 })
 
+        counts: dict[tuple, int] = {}
+        for k in keys:
+            counts[(k["key_type"], k["category"], k["ha_type"])] = counts.get((k["key_type"], k["category"], k["ha_type"]), 0) + 1
+        _LOGGER.info(
+            "Vitrea key (type, category, platform) -> count: %s",
+            ", ".join(f"{t}/{c}/{p}={n}" for (t, c, p), n in sorted(counts.items(), key=str)),
+        )
+
         scenarios: list[dict] = []
         try:
-            for sno in paced("get_scenario_numbers"):
-                try:
-                    scenarios.append({"id": sno, "name": paced("get_scenario_name", sno)})
-                except Exception:
-                    _LOGGER.warning("Vitrea: scenario %s name unavailable", sno)
+            numbers = list(paced("get_scenario_numbers"))
         except Exception as err:
             _LOGGER.warning("Vitrea: scenario list unavailable: %s", err)
+            numbers = []
+        # Opcode 66 is the list behind the app's Enable/Disable screen. The
+        # regular list can omit scenarios (seen live: 37/38/39/42), so take
+        # the union. attempts=1: a NACK here must not trigger re-logins.
+        try:
+            statuses = paced("get_scenario_statuses", attempts=1)
+        except Exception as err:
+            _LOGGER.info("Vitrea: scenario status list unavailable: %s", err)
+            statuses = {}
+        for sno in sorted(set(numbers) | set(statuses)):
+            try:
+                scenarios.append({
+                    "id": sno,
+                    "name": paced("get_scenario_name", sno),
+                    "listed": sno in numbers,
+                    "has_status": sno in statuses,
+                })
+            except Exception:
+                _LOGGER.warning("Vitrea: scenario %s name unavailable", sno)
+        extra = [s["id"] for s in scenarios if not s["listed"]]
+        if extra:
+            _LOGGER.info("Vitrea: scenarios %s are not in the regular list but exist (op 66)", extra)
+        self.scenario_enabled.update(statuses)
         return keys, scenarios
 
     # ---------------------------------------------------------------
@@ -425,13 +504,16 @@ class VitreaHub:
                 password=d[CONF_MOBILE_PASSWORD],
             )
             m.add_push_callback(self._on_push)
+            self._last_login = time.monotonic()
             try:
                 m.connect()
                 m.login()
                 # Dead-on-arrival check: a session that answers nothing right
                 # after login is useless, so fail the connect and let the
-                # caller retry rather than trusting it.
-                m.get_last_change_timestamp(timeout=LOGIN_VERIFY_TIMEOUT)
+                # caller retry rather than trusting it. The official app
+                # follows login with version -> super-user -> timestamp
+                # before anything else; do the same.
+                m.handshake(timeout=LOGIN_VERIFY_TIMEOUT)
             except Exception:
                 # Don't leak a half-open session: the box allows one per
                 # account and may keep treating the account as logged in.
@@ -443,6 +525,7 @@ class VitreaHub:
             self._mobile = m
             self._epoch += 1
             self._session_started = time.monotonic()
+            self.controller_version = getattr(m, "controller_version", None) or self.controller_version
             self.available = True
 
     def _on_push(self, push) -> None:
@@ -467,15 +550,54 @@ class VitreaHub:
 
     async def _async_watchdog_tick(self, _now) -> None:
         alive = self._mobile is not None and self._mobile._sock is not None
-        if alive:
+        if alive or self._bg_reconnecting:
             return
         _LOGGER.warning("Vitrea mobile connection down, reconnecting")
         self.available = False
+        await self._async_background_reconnect(self._epoch)
+
+    async def _async_background_reconnect(self, epoch: int) -> bool:
+        """Replace a dead session when no user is waiting on it.
+
+        Single flight (the 3 s ticks must not stack up threads while a
+        backoff is running), and it waits out the young-death backoff.
+        """
+        if self._bg_reconnecting:
+            return False
+        self._bg_reconnecting = True
         try:
-            await self.hass.async_add_executor_job(self._reconnect_with_backoff, self._epoch)
-            await self._async_refresh_all_states()
+            await self.hass.async_add_executor_job(self._background_reconnect, epoch)
         except Exception as err:
+            self.available = False
             _LOGGER.warning("Vitrea reconnect failed: %s", err)
+            return False
+        finally:
+            self._bg_reconnecting = False
+        await self._async_refresh_all_states()
+        return True
+
+    def _background_reconnect(self, seen_epoch: int) -> None:
+        self._backoff_wait(seen_epoch)
+        self._reconnect_with_backoff(seen_epoch)
+
+    def _backoff_wait(self, seen_epoch: int | None) -> None:
+        """Sleep before a background login when recent sessions died young.
+
+        Polls the epoch so that a user command which forced its own
+        reconnect meanwhile ends the wait early.
+        """
+        wait = BACKOFF_STEPS[min(self._young_deaths, len(BACKOFF_STEPS) - 1)]
+        if not wait:
+            return
+        _LOGGER.warning(
+            "Vitrea: %d sessions in a row died young, waiting %.0fs before the next login",
+            self._young_deaths, wait,
+        )
+        end = time.monotonic() + wait
+        while time.monotonic() < end:
+            if seen_epoch is not None and self._epoch != seen_epoch:
+                return
+            time.sleep(0.25)
 
     async def _async_poll_tick(self, _now) -> None:
         """Resync entity state from the box, one bulk request per node.
@@ -488,6 +610,7 @@ class VitreaHub:
             return
         if time.monotonic() - self._last_command < POLL_QUIET_AFTER_COMMAND:
             return
+        await self.async_refresh_scenario_enabled()
         # Covers report a transient "on" while moving; only lights/
         # switches/fans are corrected here, so only poll their nodes.
         nodes = sorted({n for (n, _), e in self._entities.items() if hasattr(e, "_is_on")})
@@ -539,7 +662,12 @@ class VitreaHub:
         return snap
 
     async def _async_keepalive_tick(self, _now) -> None:
-        if not self.available or self._mobile is None:
+        if self._mobile is None:
+            return
+        age = time.monotonic() - self._session_started
+        if self._young_deaths and age >= LONG_SESSION:
+            self._young_deaths = 0
+        if not self.available or self._bg_reconnecting:
             return
         if time.monotonic() - self._last_activity < KEEPALIVE_IDLE:
             return
@@ -550,27 +678,28 @@ class VitreaHub:
         except Exception as err:
             _LOGGER.warning(
                 "Vitrea session unresponsive after %.0fs (%s), reconnecting",
-                time.monotonic() - self._session_started, err,
+                age, err,
             )
-            try:
-                await self.hass.async_add_executor_job(self._reconnect_with_backoff, epoch)
-            except Exception as err2:
-                self.available = False
-                _LOGGER.warning("Vitrea reconnect failed: %s", err2)
-                return
-            await self._async_refresh_all_states()
+            await self._async_background_reconnect(epoch)
 
-    def _reconnect_with_backoff(self, seen_epoch: int | None = None) -> None:
+    def _reconnect_with_backoff(self, seen_epoch: int | None = None, deadline: float | None = None) -> None:
         # The box can hold the old session slot for a few seconds after a
         # timeout, so an immediate re-login times out too (seen live as
-        # "timeout waiting for response to opcode 1"). Back off.
+        # "timeout waiting for response to opcode 1"). Back off, and never
+        # log in more often than LOGIN_MIN_GAP.
         #
         # seen_epoch is the session epoch the caller saw fail. If it has
         # moved on by the time we get the lock, another thread already
         # replaced the session — logging in again would kill that fresh
         # session (seen live 2026-10-29 as a failed turn_off right after
         # a keepalive reconnect).
-        with self._connect_lock:
+        #
+        # deadline (a monotonic time) is set for a user command: it must
+        # not sit behind the lock or the retry schedule past its lifetime,
+        # so it raises TimeoutError instead of waiting.
+        if not self._connect_lock.acquire(timeout=-1 if deadline is None else max(0.0, deadline - time.monotonic())):
+            raise TimeoutError("a reconnect is already in progress")
+        try:
             if seen_epoch is not None and self._epoch != seen_epoch:
                 # Another thread already replaced the session. The caller
                 # may have marked us unavailable before that happened;
@@ -579,37 +708,59 @@ class VitreaHub:
                 # 2026-10-29: 224 entities at once).
                 self.available = True
                 return
+            if time.monotonic() - self._session_started < YOUNG_SESSION:
+                self._young_deaths += 1
             for attempt, delay in enumerate(RECONNECT_DELAYS):
-                time.sleep(delay)
+                wait = max(delay, LOGIN_MIN_GAP - (time.monotonic() - self._last_login))
+                if deadline is not None and time.monotonic() + wait > deadline:
+                    raise TimeoutError("the V-Box is not accepting logins right now")
+                time.sleep(wait)
                 try:
                     self._connect_mobile()
                     return
                 except Exception:
                     if attempt == len(RECONNECT_DELAYS) - 1:
+                        self._young_deaths += 1
                         raise
+        finally:
+            self._connect_lock.release()
 
     def _call(self, fn):
-        self._last_activity = time.monotonic()
-        epoch = self._epoch
-        try:
-            return fn()
-        except Exception:
-            self._reconnect_with_backoff(epoch)
-            return fn()
-
-    def _call_cmd(self, send):
-        """Run a command with a short first-try timeout (a dead session
-        should fail fast), then retry once after a reconnect with the
-        client's normal patient timeout — the box is often slow to answer
-        right after a fresh login.
+        """Run a read. Never reconnects: a dead session is replaced by the
+        keepalive/watchdog, and the state refresh that follows covers
+        whatever this read missed.
         """
         self._last_activity = time.monotonic()
+        return fn()
+
+    def _run_command(self, slot: tuple, seq: int, issued: float, send):
+        """Send one command, with a single recovery attempt.
+
+        Fail fast: the command is dropped (_Superseded) if a newer command
+        for the same slot exists, and gives up (TimeoutError) once it is
+        COMMAND_MAX_AGE old, so a muted box can never replay it late.
+        A NACK means the box answered, so only a dead/mute session
+        (timeout, closed socket) justifies the reconnect.
+        """
+        deadline = issued + COMMAND_MAX_AGE
+
+        def check() -> None:
+            if self._cmd_seq.get(slot) != seq:
+                raise _Superseded
+            if time.monotonic() > deadline:
+                raise TimeoutError("the command expired before the V-Box answered")
+
+        self._last_activity = time.monotonic()
         epoch = self._epoch
+        check()
         try:
             return send(COMMAND_TIMEOUT)
-        except Exception:
-            self._reconnect_with_backoff(epoch)
-            return send(None)
+        except (MobileVBoxConnectionError, OSError):
+            pass
+        check()
+        self._reconnect_with_backoff(epoch, deadline)
+        check()
+        return send(max(0.5, min(COMMAND_TIMEOUT, deadline - time.monotonic())))
 
     # ---------------------------------------------------------------
     # Commands
@@ -643,17 +794,42 @@ class VitreaHub:
 
         self._verify_cancel[slot] = async_call_later(self.hass, VERIFY_DELAY, _verify)
 
+    async def _async_command(self, slot: tuple, send, verify: tuple[int, int] | None = None) -> None:
+        """Run `send(timeout)` on the executor as the newest command for
+        `slot` (see _run_command). A superseded command is silently
+        dropped; any other failure reaches the user as a HomeAssistantError.
+        """
+        seq = self._cmd_seq.get(slot, 0) + 1
+        self._cmd_seq[slot] = seq
+        issued = time.monotonic()
+        try:
+            await self.hass.async_add_executor_job(self._run_command, slot, seq, issued, send)
+        except _Superseded:
+            return
+        except Exception as err:
+            raise HomeAssistantError(f"Vitrea V-Box command failed: {err}") from err
+        if verify is not None:
+            self._schedule_verify(*verify)
+
     async def async_key_on(self, node: int, key: int, ratio: int = 0, timer: int = 0) -> None:
-        await self.hass.async_add_executor_job(
-            self._call_cmd, lambda t: self._mobile.set_key_status(node, self._mk(node, key), KEY_ON, ratio=ratio, timer=timer, timeout=t)
+        await self._async_command(
+            (node, self._mk(node, key)),
+            lambda t: self._mobile.set_key_status(node, self._mk(node, key), KEY_ON, ratio=ratio, timer=timer, timeout=t),
+            verify=(node, key),
         )
-        self._schedule_verify(node, key)
 
     async def async_key_off(self, node: int, key: int, timer: int = 0) -> None:
-        await self.hass.async_add_executor_job(
-            self._call_cmd, lambda t: self._mobile.set_key_status(node, self._mk(node, key), KEY_OFF, timer=timer, timeout=t)
+        await self._async_command(
+            (node, self._mk(node, key)),
+            lambda t: self._mobile.set_key_status(node, self._mk(node, key), KEY_OFF, timer=timer, timeout=t),
+            verify=(node, key),
         )
-        self._schedule_verify(node, key)
+
+    async def async_boiler_on(self, node: int, key: int) -> None:
+        # CustomBoilers.changeState: on = status ON with timer 0xFFFF
+        # ("until switched off"); the timer is seconds for a boiler key.
+        # Unverified — no boiler circuits in the reference install.
+        await self.async_key_on(node, key, timer=BOILER_ON_TIMER)
 
     async def async_set_cover_position(self, node: int, key: int, ratio: int) -> None:
         # Confirmed live 2026-10-25 (docs/protocol-mobile.md "Cover model
@@ -661,29 +837,89 @@ class VitreaHub:
         # target position via ratio; the status byte doesn't encode
         # direction. KEY_ON is used here only because set_key_status
         # needs *some* valid status byte.
-        await self.hass.async_add_executor_job(
-            self._call_cmd,
-            lambda t: self._mobile.set_key_status(
-                node, self._mk(node, key), KEY_ON, ratio=ratio, timeout=t
-            ),
+        await self._async_command(
+            (node, self._mk(node, key)),
+            lambda t: self._mobile.set_key_status(node, self._mk(node, key), KEY_ON, ratio=ratio, timeout=t),
+            verify=(node, key),
         )
-        self._schedule_verify(node, key)
 
     async def async_stop_cover(self, node: int, key: int) -> None:
         # From the official app's own decompiled source (CustomBlinds.
         # doSendBlindStop): mid-travel stop is KEY_OFF with ratio=255 —
         # a sentinel outside the normal 0-100 range, distinct from a
         # real "closed" target (ratio=0). Confirmed live 2026-10-29.
-        await self.hass.async_add_executor_job(
-            self._call_cmd,
-            lambda t: self._mobile.set_key_status(
-                node, self._mk(node, key), KEY_OFF, ratio=255, timeout=t
-            ),
+        await self._async_command(
+            (node, self._mk(node, key)),
+            lambda t: self._mobile.set_key_status(node, self._mk(node, key), KEY_OFF, ratio=255, timeout=t),
+            verify=(node, key),
         )
-        self._schedule_verify(node, key)
 
     async def async_trigger_scenario(self, scenario_id: int) -> None:
-        await self.hass.async_add_executor_job(self._call, lambda: self._mobile.trigger_scenario(scenario_id))
+        await self._async_command(
+            ("scenario", scenario_id),
+            lambda t: self._mobile.trigger_scenario(scenario_id, timeout=t),
+        )
+
+    def device_info(self, node: int, room: str | None = None):
+        """Device registry entry for a V-Box node (a wall unit / module),
+        parented to the V-Box itself. None when the hub has no config
+        entry id (offline tests).
+        """
+        if self.entry_id is None:
+            return None
+        from homeassistant.helpers.device_registry import DeviceInfo
+
+        info = DeviceInfo(
+            identifiers={(DOMAIN, f"{self.entry_id}_node_{node}")},
+            name=f"V-Box node {node}",
+            manufacturer="Vitrea",
+            via_device=(DOMAIN, self.entry_id),
+        )
+        if self._use_areas and room:
+            info["suggested_area"] = room
+        return info
+
+    def hub_device_info(self):
+        from homeassistant.helpers.device_registry import DeviceInfo
+
+        return DeviceInfo(
+            identifiers={(DOMAIN, self.entry_id)},
+            name="Vitrea V-Box",
+            manufacturer="Vitrea",
+            model="V-Box",
+            sw_version=self.controller_version,
+        )
+
+    # ---------------------------------------------------------------
+    # Scenario enable flags (opcode 66)
+    # ---------------------------------------------------------------
+    def register_scenario_entity(self, scenario_id: int, entity) -> None:
+        self._scenario_entities[scenario_id] = entity
+
+    async def async_refresh_scenario_enabled(self) -> None:
+        """Read every scenario's enabled flag (one request) and push the
+        values to the scenario switches that exist.
+        """
+        if not self._scenario_entities or not self.available or self._mobile is None:
+            return
+        try:
+            statuses = await self.hass.async_add_executor_job(
+                self._call, self._mobile.get_scenario_statuses
+            )
+        except Exception as err:
+            _LOGGER.debug("Vitrea scenario status read failed: %s", err)
+            return
+        self.scenario_enabled.update(statuses)
+        for sid, entity in self._scenario_entities.items():
+            if sid in statuses and getattr(entity, "hass", None) is not None:
+                entity.on_enabled(statuses[sid])
+
+    async def async_set_scenario_enabled(self, scenario_id: int, enabled: bool) -> None:
+        await self._async_command(
+            ("scenario-enabled", scenario_id),
+            lambda t: self._mobile.set_scenario_enabled(scenario_id, enabled, timeout=t),
+        )
+        self.scenario_enabled[scenario_id] = enabled
 
     async def async_get_key_status(self, node: int, key: int, mobile: bool = False):
         """Fetch one key's current status — used by each entity's

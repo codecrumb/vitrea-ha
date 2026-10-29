@@ -41,6 +41,7 @@ OP_LOGIN = 1
 OP_LOGOUT = 2
 OP_GET_LAST_CHANGE_TIMESTAMP = 3
 OP_GET_CONTROLLER_VERSION = 4
+OP_GET_IF_SUPER_USER = 5
 OP_GET_ROOM_NUMBERS = 20
 OP_GET_ROOM_PARAMETERS = 21
 OP_GET_NODE_NUMBERS = 30
@@ -52,6 +53,7 @@ OP_GET_ALL_KEY_STATUS = 52
 OP_GET_SCENARIO_NUMBERS = 60
 OP_GET_SCENARIO_PARAMETERS = 61
 OP_SET_SCENARIO_STATUS = 62
+OP_GET_SCENARIOS_STATUS = 66
 
 # NodeKey.KeyStatus — same ASCII codes as the admin protocol.
 KEY_ON = 0x4F   # 'O'
@@ -67,6 +69,12 @@ STATUS_ENABLED = 1
 STATUS_EXECUTE = 2
 
 NACK_BAD_CREDENTIALS = 0x02
+
+# Boiler keys are timed switches: the official app turns one on with
+# timer=0xFFFF ("stay on until told otherwise", CustomBoilers.changeState)
+# and its timer slider sends minutes*60, i.e. the 16-bit timer is SECONDS
+# for a boiler. Other key types ignore the timer or treat it as a fade.
+BOILER_ON_TIMER = 0xFFFF
 
 
 @dataclass
@@ -97,6 +105,12 @@ class MobileVBoxError(RuntimeError):
 
 class MobileVBoxAuthError(MobileVBoxError):
     pass
+
+
+class MobileVBoxConnectionError(MobileVBoxError):
+    """The session is dead or mute (timeout, closed socket) -- as opposed
+    to the box answering with a NACK. Only this kind justifies a re-login.
+    """
 
 
 def _checksum(buf: bytes) -> int:
@@ -146,6 +160,10 @@ class MobileVBox:
         self._push_callbacks: list = []
         self._reader_thread: threading.Thread | None = None
         self._reader_stop = threading.Event()
+        self._logged_in = False
+        # Filled by handshake(); None until then (or if the box NACKed).
+        self.controller_version: str | None = None
+        self.is_super_user: bool | None = None
 
     @classmethod
     def from_creds_file(cls, path: Path | str = DEFAULT_CREDS_FILE, **overrides) -> "MobileVBox":
@@ -177,9 +195,23 @@ class MobileVBox:
         self._sock = s
         self._start_reader()
 
-    def close(self):
+    def close(self, logout: bool = True):
+        # The official app always sends a Logout before dropping its
+        # socket (TCPClient.logoutClient). Just closing the socket leaves
+        # the box holding the session until it decides it is dead, a
+        # plausible contributor to the box getting muted/stuck under a
+        # client that reconnects a lot. Best effort, bounded wait.
+        if logout and self._logged_in and self._sock is not None:
+            self._logout()
+        self._logged_in = False
         self._reader_stop.set()
         if self._sock is not None:
+            try:
+                # close() alone does not wake a reader blocked in recv(),
+                # which made every close wait out the 2 s join below.
+                self._sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             try:
                 self._sock.close()
             finally:
@@ -187,6 +219,30 @@ class MobileVBox:
         if self._reader_thread is not None:
             self._reader_thread.join(timeout=2)
             self._reader_thread = None
+
+    def _logout(self, wait: float = 0.5) -> None:
+        """Send Logout (opcode 2) and wait briefly for the ACK. Never
+        raises: a dead session simply costs `wait` seconds.
+        """
+        if not self._send_lock.acquire(timeout=wait):
+            return  # another request is stuck in flight; don't pile on
+        try:
+            sock = self._sock
+            if sock is None:
+                return
+            ev = threading.Event()
+            with self._awaiting_lock:
+                self._awaiting = {"opcodes": {OP_LOGOUT, OP_ACK}, "event": ev, "result": []}
+            try:
+                sock.settimeout(wait)
+                sock.sendall(_frame(OP_LOGOUT, self._next_msg_id()))
+            except OSError:
+                return
+            ev.wait(timeout=wait)
+        finally:
+            with self._awaiting_lock:
+                self._awaiting = None
+            self._send_lock.release()
 
     def add_push_callback(self, cb) -> None:
         """Register a callback(KeyStatusPush) for unsolicited status changes.
@@ -299,7 +355,7 @@ class MobileVBox:
         ACK, and a failed one replies with ACK carrying a NACK payload.
         """
         if self._sock is None:
-            raise MobileVBoxError("not connected")
+            raise MobileVBoxConnectionError("not connected")
         expect = expect if expect is not None else {opcode, OP_ACK}
         with self._send_lock:
             msg_id = self._next_msg_id()
@@ -312,7 +368,7 @@ class MobileVBox:
             if not ev.wait(timeout=timeout if timeout is not None else self.read_timeout):
                 with self._awaiting_lock:
                     self._awaiting = None
-                raise MobileVBoxError(f"timeout waiting for response to opcode {opcode}")
+                raise MobileVBoxConnectionError(f"timeout waiting for response to opcode {opcode}")
             return result[0]
 
     def _recv_frame(self) -> tuple[int, bytes]:
@@ -337,7 +393,7 @@ class MobileVBox:
         while len(buf) < n:
             chunk = self._sock.recv(n - len(buf))
             if not chunk:
-                raise MobileVBoxError("connection closed")
+                raise MobileVBoxConnectionError("connection closed")
             buf.extend(chunk)
         return bytes(buf)
 
@@ -347,10 +403,31 @@ class MobileVBox:
         payload = _str_param(self.user) + _str_param(self.password)
         opcode, resp = self._send(OP_LOGIN, payload)
         if opcode == OP_LOGIN:
+            self._logged_in = True
             return  # success — payload is an undecoded session/version blob
         if opcode == OP_ACK and resp and resp[0] == NACK_BAD_CREDENTIALS:
             raise MobileVBoxAuthError(f"login failed for user {self.user!r}: bad credentials")
         raise MobileVBoxError(f"unexpected login response: opcode={opcode} payload={resp!r}")
+
+    def handshake(self, timeout: float | None = None) -> None:
+        """The official app's post-login sequence (AppControlPro /
+        SystemDetails event chain): controller version (4), super-user
+        check (5), last-change timestamp (3) -- then it starts loading.
+
+        Doubles as the dead-on-arrival check: the version request must be
+        answered (an ACK/NACK counts), otherwise this raises and the
+        caller discards the session. The later steps are best effort.
+        """
+        opcode, p = self._send(OP_GET_CONTROLLER_VERSION, timeout=timeout)
+        if opcode == OP_GET_CONTROLLER_VERSION and len(p) >= 3:
+            self.controller_version = f"{p[0]}.{p[1]}.{p[2]}"
+        for op in (OP_GET_IF_SUPER_USER, OP_GET_LAST_CHANGE_TIMESTAMP):
+            try:
+                opcode, p = self._send(op, timeout=timeout)
+            except MobileVBoxConnectionError:
+                return
+            if op == OP_GET_IF_SUPER_USER and opcode == op and p:
+                self.is_super_user = p[0] == 1
 
     # -- Scenarios ------------------------------------------------------------
 
@@ -361,14 +438,28 @@ class MobileVBox:
         n = payload[0]
         return list(payload[1 : 1 + n])
 
-    def trigger_scenario(self, number: int):
-        opcode, resp = self._send(OP_SET_SCENARIO_STATUS, bytes([number, STATUS_EXECUTE]))
+    def get_scenario_statuses(self) -> dict[int, bool]:
+        """Opcode 66: {scenario number: enabled} for EVERY scenario.
+
+        This is the list behind the app's Enable/Disable screen. The
+        regular list (opcode 60) is what the main screen shows, and on a
+        live box it omitted some scenarios (37/38/39/42); this one is
+        expected to include them (unverified). Payload per the app's
+        checkScenarioStatus: [count, (number, enabled)*count], enabled == 1.
+        """
+        opcode, p = self._send(OP_GET_SCENARIOS_STATUS)
+        if opcode != OP_GET_SCENARIOS_STATUS or not p:
+            raise MobileVBoxError(f"get_scenario_statuses failed: opcode={opcode} payload={p!r}")
+        return {p[1 + 2 * i]: p[2 + 2 * i] == 1 for i in range(p[0]) if 2 + 2 * i < len(p)}
+
+    def trigger_scenario(self, number: int, timeout: float | None = None):
+        opcode, resp = self._send(OP_SET_SCENARIO_STATUS, bytes([number, STATUS_EXECUTE]), timeout=timeout)
         if opcode != OP_SET_SCENARIO_STATUS and not (opcode == OP_ACK and resp and resp[0] == 0):
             raise MobileVBoxError(f"trigger scenario {number} failed: opcode={opcode} payload={resp!r}")
 
-    def set_scenario_enabled(self, number: int, enabled: bool):
+    def set_scenario_enabled(self, number: int, enabled: bool, timeout: float | None = None):
         status = STATUS_ENABLED if enabled else STATUS_DISABLED
-        opcode, resp = self._send(OP_SET_SCENARIO_STATUS, bytes([number, status]))
+        opcode, resp = self._send(OP_SET_SCENARIO_STATUS, bytes([number, status]), timeout=timeout)
         if opcode != OP_SET_SCENARIO_STATUS and not (opcode == OP_ACK and resp and resp[0] == 0):
             raise MobileVBoxError(f"set scenario {number} enabled={enabled} failed")
 
@@ -471,7 +562,9 @@ class MobileVBox:
         ratio:  dimmer level 0-100, or absolute blind position 0-100
                 for cover-type keys (confirmed live 2026-10-25 — see
                 docs/protocol-mobile.md "Cover model resolved")
-        timer:  fade time in ms (16-bit, big-endian in wire format)
+        timer:  16-bit big-endian on the wire. A fade time for dimmers;
+                for a boiler key it is seconds, and BOILER_ON_TIMER
+                (0xFFFF) means "on until turned off".
         """
         payload = bytes([node_no, key_no + 1, status, ratio, (timer >> 8) & 0xFF, timer & 0xFF])
         opcode, resp = self._send(OP_SET_KEY_STATUS, payload, timeout=timeout)

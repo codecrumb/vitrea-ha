@@ -25,11 +25,13 @@
         "title": "Vitrea V-Box options",
         "data": {
           "disable_metadata_cache": "Rescan device on every startup",
-          "excluded_keys": "Excluded keys"
+          "excluded_keys": "Excluded keys",
+          "use_rooms_as_areas": "Use V-Box rooms as areas"
         },
         "data_description": {
           "disable_metadata_cache": "Skip the metadata cache. Turn on, click Reload, then turn off again to force a one-off rescan.",
-          "excluded_keys": "Comma-separated node:key pairs (0-indexed) to skip, e.g. 12:3,40:0"
+          "excluded_keys": "Comma-separated node:key pairs (0-indexed) to skip, e.g. 12:3,40:0",
+          "use_rooms_as_areas": "Suggest each node's V-Box room as the Home Assistant area when its device is first created. Turn on before the first run; HA creates any missing areas."
         }
       }
     }

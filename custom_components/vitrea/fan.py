@@ -36,6 +36,7 @@ class VitreaFan(FanEntity):
         self._key = key["key"]
         self._attr_name = key["name"]
         self._attr_unique_id = f"vitrea_{self._node}_{self._key}"
+        self._attr_device_info = hub.device_info(self._node, key.get("room"))
         self._is_on = False
         hub.register_entity(self._node, self._key, self)
 
