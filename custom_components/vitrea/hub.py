@@ -51,8 +51,16 @@ POLL_INTERVAL = timedelta(minutes=5)
 # truth, the poll is only a slow safety net, node status is shared via a
 # short cache, and an idle session gets a cheap ping so a dead one is
 # replaced before a user command hits it.
-KEEPALIVE_CHECK = timedelta(seconds=30)
-KEEPALIVE_IDLE = 55.0
+# Measured live 2026-10-29: the box silently stops answering a session every
+# few minutes (7 dead sessions caught in ~20 min), and a normal reply takes
+# ~10 ms. Ping often enough that a dead session is replaced in the
+# background before a user command hits it, and use a short timeout for
+# pings and commands so a command that does hit a dead one stalls ~4 s
+# (timeout + reconnect) instead of ~11 s (10 s timeout + reconnect).
+KEEPALIVE_CHECK = timedelta(seconds=5)
+KEEPALIVE_IDLE = 10.0
+KEEPALIVE_TIMEOUT = 3.0
+COMMAND_TIMEOUT = 3.0
 STATUS_CACHE_TTL = 5.0
 METADATA_CACHE_VERSION = 1
 METADATA_PACE = 0.1
@@ -493,7 +501,7 @@ class VitreaHub:
         if time.monotonic() - self._last_activity < KEEPALIVE_IDLE:
             return
         try:
-            await self.hass.async_add_executor_job(self._mobile.get_last_change_timestamp)
+            await self.hass.async_add_executor_job(self._mobile.get_last_change_timestamp, KEEPALIVE_TIMEOUT)
             self._last_activity = time.monotonic()
         except Exception as err:
             _LOGGER.warning("Vitrea session unresponsive (%s), reconnecting", err)
@@ -539,7 +547,17 @@ class VitreaHub:
         async def _verify(_now) -> None:
             self._verify_cancel.pop(slot, None)
             entity = self._entities.get(slot)
-            if entity is None or not hasattr(entity, "_is_on"):
+            if entity is None:
+                return
+            if hasattr(entity, "_position"):
+                # Cover: a missed push would leave the position stale. A
+                # moving blind reports a transient is_on (ignored by the
+                # entity), so this only lands once it has stopped/arrived.
+                ks = await self.async_get_key_status(*slot, mobile=True)
+                if ks is not None and not ks.is_on and entity._position != ks.ratio:
+                    entity.on_push_state(ks.is_on, ks.ratio)
+                return
+            if not hasattr(entity, "_is_on"):
                 return
             ks = await self.async_get_key_status(*slot, mobile=True)
             if ks is not None and entity._is_on != ks.is_on:
@@ -549,13 +567,13 @@ class VitreaHub:
 
     async def async_key_on(self, node: int, key: int, ratio: int = 0, timer: int = 0) -> None:
         await self.hass.async_add_executor_job(
-            self._call, lambda: self._mobile.set_key_status(node, self._mk(node, key), KEY_ON, ratio=ratio, timer=timer)
+            self._call, lambda: self._mobile.set_key_status(node, self._mk(node, key), KEY_ON, ratio=ratio, timer=timer, timeout=COMMAND_TIMEOUT)
         )
         self._schedule_verify(node, key)
 
     async def async_key_off(self, node: int, key: int, timer: int = 0) -> None:
         await self.hass.async_add_executor_job(
-            self._call, lambda: self._mobile.set_key_status(node, self._mk(node, key), KEY_OFF, timer=timer)
+            self._call, lambda: self._mobile.set_key_status(node, self._mk(node, key), KEY_OFF, timer=timer, timeout=COMMAND_TIMEOUT)
         )
         self._schedule_verify(node, key)
 
@@ -566,9 +584,12 @@ class VitreaHub:
         # direction. KEY_ON is used here only because set_key_status
         # needs *some* valid status byte.
         await self.hass.async_add_executor_job(
-            self._call, lambda: self._mobile.set_key_status(node, self._mk(node, key), KEY_ON, ratio=ratio)
+            self._call,
+            lambda: self._mobile.set_key_status(
+                node, self._mk(node, key), KEY_ON, ratio=ratio, timeout=COMMAND_TIMEOUT
+            ),
         )
-        self._last_command = time.monotonic()
+        self._schedule_verify(node, key)
 
     async def async_stop_cover(self, node: int, key: int) -> None:
         # From the official app's own decompiled source (CustomBlinds.
@@ -576,9 +597,12 @@ class VitreaHub:
         # a sentinel outside the normal 0-100 range, distinct from a
         # real "closed" target (ratio=0). Confirmed live 2026-10-29.
         await self.hass.async_add_executor_job(
-            self._call, lambda: self._mobile.set_key_status(node, self._mk(node, key), KEY_OFF, ratio=255)
+            self._call,
+            lambda: self._mobile.set_key_status(
+                node, self._mk(node, key), KEY_OFF, ratio=255, timeout=COMMAND_TIMEOUT
+            ),
         )
-        self._last_command = time.monotonic()
+        self._schedule_verify(node, key)
 
     async def async_trigger_scenario(self, scenario_id: int) -> None:
         await self.hass.async_add_executor_job(self._call, lambda: self._mobile.trigger_scenario(scenario_id))

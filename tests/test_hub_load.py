@@ -20,8 +20,8 @@ class KS:
 class FakeMobile:
     def __init__(s): s.calls=[]; s.ts=b"\x01\x02"; s._sock=object(); s.fail_ping=False
     def get_all_key_status(s,n): s.calls.append(("all",n)); return [KS(n,0,True),KS(n,1,False)]
-    def get_last_change_timestamp(s):
-        s.calls.append(("ts",))
+    def get_last_change_timestamp(s,timeout=None):
+        s.calls.append(("ts",)); s.last_ts_timeout=timeout
         if s.fail_ping: raise RuntimeError("timeout")
         return s.ts
 class Hass:
@@ -40,6 +40,7 @@ async def main():
     # keepalive: skipped when recently active, pings when idle, reconnects on failure
     h=mk(); await h._async_keepalive_tick(None); assert not h._mobile.calls
     h._last_activity-=100; await h._async_keepalive_tick(None); assert h._mobile.calls==[("ts",)]
+    assert h._mobile.last_ts_timeout is not None and h._mobile.last_ts_timeout<=5, h._mobile.last_ts_timeout  # short ping timeout
     h._last_activity-=100; h._mobile.fail_ping=True; recon=[]
     h._reconnect_with_backoff=lambda: recon.append(1); 
     async def noref(): pass
@@ -54,5 +55,15 @@ async def main():
     # timestamp unreadable + cache present -> use cache, no scan
     h=mk(); h._mobile.fail_ping=True; h._fetch_metadata=fm; h._async_migrate_unique_ids=lambda: None
     await h._async_fetch_and_apply_metadata(); assert len(scans)==2
+    # cover verify after a command: a missed push must not leave the position stale,
+    # but a still-moving blind (transient is_on) must not be applied
+    class KS2(KS):
+        def __init__(s,node,key,on,ratio): super().__init__(node,key,on); s.ratio=ratio
+    captured=[]; hub.async_call_later=lambda hass,delay,fn:(captured.append(fn),lambda:None)[1]
+    for status,expect in (([KS2(5,0,False,40)],[(False,40)]), ([KS2(5,0,True,0)],[])):
+        h=mk(); h._mobile.get_all_key_status=lambda n,status=status:status
+        seen=[]; h._entities={(5,0):types.SimpleNamespace(_position=100,on_push_state=lambda on,r:seen.append((on,r)))}
+        captured.clear(); h._schedule_verify(5,0); assert len(captured)==1
+        await captured[0](None); assert seen==expect,(status,seen)
     print("all hub tests passed")
 asyncio.run(main())

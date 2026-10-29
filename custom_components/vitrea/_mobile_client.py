@@ -289,7 +289,8 @@ class MobileVBox:
             ))
         return out
 
-    def _send(self, opcode: int, payload: bytes = b"", expect: set[int] | None = None) -> tuple[int, bytes]:
+    def _send(self, opcode: int, payload: bytes = b"", expect: set[int] | None = None,
+              timeout: float | None = None) -> tuple[int, bytes]:
         """Send a request, block for the matching reply.
 
         `expect` is the set of response opcodes that count as "this is
@@ -308,7 +309,7 @@ class MobileVBox:
             with self._awaiting_lock:
                 self._awaiting = {"opcodes": expect, "event": ev, "result": result}
             self._sock.sendall(frame)
-            if not ev.wait(timeout=self.read_timeout):
+            if not ev.wait(timeout=timeout if timeout is not None else self.read_timeout):
                 with self._awaiting_lock:
                     self._awaiting = None
                 raise MobileVBoxError(f"timeout waiting for response to opcode {opcode}")
@@ -380,14 +381,14 @@ class MobileVBox:
         n = payload[0]
         return list(payload[1 : 1 + n])
 
-    def get_last_change_timestamp(self) -> bytes:
+    def get_last_change_timestamp(self, timeout: float | None = None) -> bytes:
         """Opcode 3: when the controller's configuration last changed.
 
         6 bytes, confirmed live 2026-10-26: [min, hour, day, month, 20, yy]
         (e.g. 1d 16 19 0a 14 1a = 2026-10-25 22:29). Stable between
         calls, so it doubles as a cheap cache key and a keepalive ping.
         """
-        opcode, p = self._send(OP_GET_LAST_CHANGE_TIMESTAMP)
+        opcode, p = self._send(OP_GET_LAST_CHANGE_TIMESTAMP, timeout=timeout)
         if opcode != OP_GET_LAST_CHANGE_TIMESTAMP:
             raise MobileVBoxError(f"get_last_change_timestamp failed: opcode={opcode}")
         return bytes(p)
@@ -458,7 +459,8 @@ class MobileVBox:
                 return ks
         return None
 
-    def set_key_status(self, node_no: int, key_no: int, status: int, ratio: int = 0, timer: int = 0):
+    def set_key_status(self, node_no: int, key_no: int, status: int, ratio: int = 0, timer: int = 0,
+                       timeout: float | None = None):
         """Directly control a key (output) on a node.
 
         key_no: 0-indexed, matching the admin protocol / key-map.json
@@ -472,7 +474,7 @@ class MobileVBox:
         timer:  fade time in ms (16-bit, big-endian in wire format)
         """
         payload = bytes([node_no, key_no + 1, status, ratio, (timer >> 8) & 0xFF, timer & 0xFF])
-        opcode, resp = self._send(OP_SET_KEY_STATUS, payload)
+        opcode, resp = self._send(OP_SET_KEY_STATUS, payload, timeout=timeout)
         if opcode != OP_SET_KEY_STATUS and not (opcode == OP_ACK and resp and resp[0] == 0):
             raise MobileVBoxError(f"set_key_status N{node_no}-{key_no} failed: opcode={opcode} payload={resp!r}")
 
