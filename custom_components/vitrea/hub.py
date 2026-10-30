@@ -277,6 +277,10 @@ class VitreaHub:
             self._async_migrate_unique_ids()
         except Exception:
             _LOGGER.exception("Vitrea unique-id migration failed")
+        try:
+            self._async_apply_rooms_as_areas()
+        except Exception:
+            _LOGGER.exception("Vitrea: assigning rooms as areas failed")
         self.metadata_ready = True
         for callback in self._metadata_listeners:
             try:
@@ -284,6 +288,31 @@ class VitreaHub:
             except Exception:
                 _LOGGER.exception("Vitrea metadata listener failed")
         self._metadata_listeners.clear()
+
+    def _async_apply_rooms_as_areas(self) -> None:
+        """With the "rooms as areas" option on, put each node's device in the
+        area named after its V-Box room, creating the area only if no area
+        of that name exists (HA matches names case-insensitively). Works on
+        devices that already exist, but never overrides an area the user
+        has set.
+        """
+        if not (self._use_areas and self.entry_id):
+            return
+        from homeassistant.helpers import area_registry as ar, device_registry as dr
+
+        areas, devices = ar.async_get(self.hass), dr.async_get(self.hass)
+        rooms: dict[int, str] = {}
+        for k in self.keys:
+            if k.get("room"):
+                rooms.setdefault(k["node"], k["room"])
+        for node, room in rooms.items():
+            dev = devices.async_get_or_create(
+                config_entry_id=self.entry_id, **self.device_info(node, None)
+            )
+            if dev.area_id:
+                continue
+            area = areas.async_get_area_by_name(room) or areas.async_create(room)
+            devices.async_update_device(dev.id, area_id=area.id)
 
     def _async_migrate_unique_ids(self) -> None:
         """Move entities registered under admin key indices to mobile ones.
@@ -312,18 +341,18 @@ class VitreaHub:
             new = f"vitrea_{node}_{k['key']}"
             if new != e.unique_id:
                 moves.append((e.entity_id, new))
+        moved = {eid for eid, _ in moves}
+        # Never delete anything: an entity outside this migration that already
+        # owns a target ID makes that one move impossible, so skip it.
+        owners = {e.unique_id: e.entity_id for e in reg.entities.values() if e.platform == DOMAIN}
+        blocked = [(eid, new) for eid, new in moves if owners.get(new) not in (None, eid) and owners[new] not in moved]
+        for eid, new in blocked:
+            _LOGGER.warning("Vitrea: not migrating %s, unique id %s is taken by %s", eid, new, owners[new])
+        moves = [m for m in moves if m not in blocked]
         if not moves:
             return
         for eid, _ in moves:
             reg.async_update_entity(eid, new_unique_id=f"vitrea_migrating_{eid}")
-        targets = {new for _, new in moves}
-        moved = {eid for eid, _ in moves}
-        # A leftover legacy entity (e.g. a key later excluded via config)
-        # that still owns an ID we are about to assign would block the move.
-        for e in list(reg.entities.values()):
-            if e.platform == DOMAIN and e.unique_id in targets and e.entity_id not in moved:
-                _LOGGER.warning("Vitrea: removing stale entity %s blocking id %s", e.entity_id, e.unique_id)
-                reg.async_remove(e.entity_id)
         for eid, new in moves:
             try:
                 reg.async_update_entity(eid, new_unique_id=new)

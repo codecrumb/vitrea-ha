@@ -10,13 +10,22 @@
           "mobile_user": "Mobile user (vitrea1-vitrea8)",
           "mobile_password": "Mobile password"
         }
+      },
+      "reauth_confirm": {
+        "title": "Re-enter your V-Box password",
+        "description": "The V-Box rejected the saved password.",
+        "data": {
+          "mobile_password": "Mobile password"
+        }
       }
     },
     "error": {
-      "cannot_connect": "Could not connect or log in. Check the IP, port, account and password, and that no other device is logged in with this account."
+      "cannot_connect": "Could not connect or log in. Check the IP, port, account and password, and that no other device is logged in with this account.",
+      "invalid_auth": "The V-Box rejected the account or password. Check the mobile user and password."
     },
     "abort": {
-      "already_configured": "This V-Box is already configured."
+      "already_configured": "This V-Box is already configured.",
+      "reauth_successful": "Password updated."
     }
   },
   "options": {
@@ -31,7 +40,7 @@
         "data_description": {
           "disable_metadata_cache": "Skip the metadata cache. Turn on, click Reload, then turn off again to force a one-off rescan.",
           "excluded_keys": "Comma-separated node:key pairs (0-indexed) to skip, e.g. 12:3,40:0",
-          "use_rooms_as_areas": "Suggest each node's V-Box room as the Home Assistant area when its device is first created. Turn on before the first run; HA creates any missing areas."
+          "use_rooms_as_areas": "Put each node's device in the area named after its V-Box room (existing areas of the same name are reused, others are created). Never overrides an area you set yourself."
         }
       }
     }

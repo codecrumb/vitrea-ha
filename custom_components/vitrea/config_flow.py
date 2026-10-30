@@ -17,7 +17,22 @@ from .const import (
     DEFAULT_EXCLUDED_KEYS,
     DEFAULT_USE_ROOMS_AS_AREAS,
 )
-from ._mobile_client import MobileVBox
+from ._mobile_client import MobileVBox, MobileVBoxAuthError
+
+
+def _try_mobile_login(data: dict) -> None:
+    """Log in once to validate credentials; always releases the session."""
+    m = MobileVBox(
+        host=data["host"],
+        port=data[CONF_MOBILE_PORT],
+        user=data[CONF_MOBILE_USER],
+        password=data[CONF_MOBILE_PASSWORD],
+    )
+    try:
+        m.connect()
+        m.login()
+    finally:
+        m.close()
 
 
 class VitreaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -27,26 +42,40 @@ class VitreaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def async_get_options_flow(config_entry: config_entries.ConfigEntry) -> "VitreaOptionsFlow":
         return VitreaOptionsFlow()
 
-    async def async_step_user(self, user_input=None) -> FlowResult:
+    async def async_step_reauth(self, entry_data) -> FlowResult:
+        return await self.async_step_reauth_confirm()
+
+    async def async_step_reauth_confirm(self, user_input=None) -> FlowResult:
+        entry = self._get_reauth_entry()
         errors = {}
         if user_input is not None:
+            data = {**entry.data, CONF_MOBILE_PASSWORD: user_input[CONF_MOBILE_PASSWORD]}
             try:
-                def _try_mobile_login():
-                    m = MobileVBox(
-                        host=user_input["host"],
-                        port=user_input[CONF_MOBILE_PORT],
-                        user=user_input[CONF_MOBILE_USER],
-                        password=user_input[CONF_MOBILE_PASSWORD],
-                    )
-                    m.connect()
-                    m.login()
-                    m.close()
-
-                await self.hass.async_add_executor_job(_try_mobile_login)
+                await self.hass.async_add_executor_job(_try_mobile_login, data)
+            except MobileVBoxAuthError:
+                errors["base"] = "invalid_auth"
             except Exception:
                 errors["base"] = "cannot_connect"
             else:
-                await self.async_set_unique_id(user_input["host"])
+                return self.async_update_reload_and_abort(entry, data=data)
+        return self.async_show_form(
+            step_id="reauth_confirm",
+            data_schema=vol.Schema({vol.Required(CONF_MOBILE_PASSWORD): str}),
+            errors=errors,
+        )
+
+    async def async_step_user(self, user_input=None) -> FlowResult:
+        errors = {}
+        if user_input is not None:
+            user_input = {**user_input, "host": user_input["host"].strip()}
+            try:
+                await self.hass.async_add_executor_job(_try_mobile_login, user_input)
+            except MobileVBoxAuthError:
+                errors["base"] = "invalid_auth"
+            except Exception:
+                errors["base"] = "cannot_connect"
+            else:
+                await self.async_set_unique_id(user_input["host"].lower())
                 self._abort_if_unique_id_configured()
                 return self.async_create_entry(
                     title=f"Vitrea V-Box ({user_input['host']})",

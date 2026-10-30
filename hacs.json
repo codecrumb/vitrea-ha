@@ -2,5 +2,6 @@
   "name": "Vitrea V-Box",
   "render_readme": true,
   "zip_release": true,
-  "filename": "vitrea-ha.zip"
+  "filename": "vitrea-ha.zip",
+  "homeassistant": "2024.11.0"
 }

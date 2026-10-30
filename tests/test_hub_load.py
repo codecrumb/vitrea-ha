@@ -243,5 +243,29 @@ async def main():
     h=mk(); h._data={"host":"x",hub.CONF_MOBILE_PORT:1,hub.CONF_MOBILE_USER:"u",hub.CONF_MOBILE_PASSWORD:"p"}; h.available=False
     h._reconnect_with_backoff()
     assert h._mobile is Flaky.made[2] and Flaky.made[0].closed and Flaky.made[1].closed and h.available, [m.closed for m in Flaky.made]
+    # rooms as areas: match an existing area by name, create only if missing, never override a user's area
+    class Dev:
+        def __init__(s,i,area=None): s.id,s.area_id=i,area
+    class Devs:
+        def __init__(s): s.d={}; s.upd=[]
+        def async_get_or_create(s,config_entry_id,identifiers,**kw):
+            key=next(iter(identifiers)); return s.d.setdefault(key,Dev(key[1][-6:], "user-area" if key[1].endswith("node_9") else None))
+        def async_update_device(s,i,area_id): s.upd.append((i,area_id))
+    class Areas:
+        def __init__(s): s.made=[]
+        def async_get_area_by_name(s,n): return types.SimpleNamespace(id="a-kitchen") if n.lower()=="kitchen" else None
+        def async_create(s,n): s.made.append(n); return types.SimpleNamespace(id="a-"+n)
+    devs,areas=Devs(),Areas()
+    arm=types.ModuleType("homeassistant.helpers.area_registry"); arm.async_get=lambda h: areas
+    drm=types.ModuleType("homeassistant.helpers.device_registry"); drm.async_get=lambda h: devs
+    class DeviceInfo(dict): pass
+    drm.DeviceInfo=DeviceInfo
+    hp=sys.modules["homeassistant.helpers"]; hp.area_registry=arm; hp.device_registry=drm
+    sys.modules["homeassistant.helpers.area_registry"]=arm; sys.modules["homeassistant.helpers.device_registry"]=drm
+    h=hub.VitreaHub(Hass(),{"host":"x"},{hub.CONF_USE_ROOMS_AS_AREAS:True},"E1")
+    h.keys=[{"node":1,"room":"Kitchen"},{"node":2,"room":"Hall"},{"node":9,"room":"Hall"},{"node":3,"room":""}]
+    h._async_apply_rooms_as_areas()
+    assert sorted(devs.upd)==sorted([("node_1","a-kitchen"),("node_2","a-Hall")]) and areas.made==["Hall"], (devs.upd,areas.made)
+    h=hub.VitreaHub(Hass(),{"host":"x"},{},"E1"); h.keys=[{"node":1,"room":"Kitchen"}]; devs.upd.clear(); h._async_apply_rooms_as_areas(); assert devs.upd==[]
     print("all hub tests passed")
 asyncio.run(main())

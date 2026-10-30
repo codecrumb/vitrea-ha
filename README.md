@@ -16,10 +16,11 @@ admin session, the official integration doesn't work alongside it.
 
 This integration instead uses the V-Box's **mobile protocol** (the one
 the phone app uses, port 11503, separate login accounts
-`vitrea1`-`vitrea8`), so it runs completely independently of whatever
-else is already talking to your box over the admin protocol. Use this
-only if that's your situation — otherwise the official integration is
-better supported and more complete.
+`vitrea1`-`vitrea8`), so it never uses the admin session. In the
+author's setup (one install, with Control4 running on the admin
+channel) the two coexist; other installs are untested. Use this only if
+that's your situation — otherwise the official integration is better
+supported and more complete.
 
 ## What it supports
 
@@ -32,7 +33,7 @@ better supported and more complete.
 - **Covers / blinds** (continuous absolute position, with mid-travel stop)
 - **Scenes** (your V-Box's saved scenarios, including ones the app's
   main list omits)
-- A device per V-Box node under a "Vitrea V-Box" device
+- Devices: one per V-Box node, plus a "Vitrea V-Box" device and a "Vitrea Scenes" device
 - Live push updates (no polling needed in the normal case), with a
   reconnect watchdog, an idle keepalive, and a slow safety-net poll to
   correct any state drift from a missed push
@@ -80,9 +81,10 @@ Reachable from the integration's **Configure** button:
   install, so this is off by default; turn it on, click **Reload**,
   then turn it back off to force a one-off fresh scan (e.g. after
   renaming something on the box itself).
-- **Use V-Box rooms as areas** (off by default) — suggests each node's
-  V-Box room as its Home Assistant area when the device is first created.
-  Turn it on before the first run; HA creates any missing areas.
+- **Use V-Box rooms as areas** (off by default) — puts each node's device in
+  the area named after its V-Box room, reusing an existing area of the
+  same name (case-insensitive) and creating one otherwise. Also applies to
+  devices that already exist, but never overrides an area you set.
 - **Excluded keys** — comma-separated `node:key` pairs (0-indexed) to
   skip when building entities, for any key that turns out to be a
   duplicate/ghost circuit on your particular install.
@@ -173,6 +175,13 @@ and the debug log lines around the problem.
   supported integration. It's been run live against a real V-Box for
   months without major issues, but Vitrea could change the protocol at
   any time.
+
+## Disclaimer
+
+This is an unofficial, community project. It is not affiliated with,
+endorsed by, or supported by Vitrea. "Vitrea" and the logo are
+trademarks of their owner and appear here only to identify the hardware
+this integration talks to.
 
 ## License
 
