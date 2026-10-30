@@ -873,7 +873,9 @@ class VitreaHub:
             identifiers={(DOMAIN, f"{self.entry_id}_node_{node}")},
             name=f"V-Box node {node}",
             manufacturer="Vitrea",
-            via_device=(DOMAIN, self.entry_id),
+            # No via_device: recent HA versions reject it when entities
+            # create the device (seen live on 2026.10), which stopped every
+            # entity from being added.
         )
         if self._use_areas and room:
             info["suggested_area"] = room
