@@ -29,6 +29,7 @@ class VitreaScene(Scene):
         # scene by mistake.
         self._attr_name = f"Scene: {scenario['name']}"
         self._attr_unique_id = f"vitrea_scene_{self._scenario_id}"
+        self._attr_device_info = hub.scenes_device_info()
 
     async def async_activate(self, **kwargs) -> None:
         await self._hub.async_trigger_scenario(self._scenario_id)

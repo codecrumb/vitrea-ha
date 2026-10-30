@@ -83,6 +83,7 @@ class VitreaScenarioSwitch(SwitchEntity):
         self._scenario_id = scenario["id"]
         self._attr_name = f"Scenario enabled: {scenario['name']}"
         self._attr_unique_id = f"vitrea_scenario_enabled_{self._scenario_id}"
+        self._attr_device_info = hub.scenes_device_info()
         self._is_on = hub.scenario_enabled.get(self._scenario_id, False)
         hub.register_scenario_entity(self._scenario_id, self)
 

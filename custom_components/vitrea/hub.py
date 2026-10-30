@@ -881,6 +881,19 @@ class VitreaHub:
             info["suggested_area"] = room
         return info
 
+    def scenes_device_info(self):
+        """One device for all scenes and scenario switches, so they are not
+        left ungrouped. None when the hub has no config entry id."""
+        if self.entry_id is None:
+            return None
+        from homeassistant.helpers.device_registry import DeviceInfo
+
+        return DeviceInfo(
+            identifiers={(DOMAIN, f"{self.entry_id}_scenes")},
+            name="Vitrea Scenes",
+            manufacturer="Vitrea",
+        )
+
     def hub_device_info(self):
         from homeassistant.helpers.device_registry import DeviceInfo
 
