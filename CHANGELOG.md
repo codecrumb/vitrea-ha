@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.5.0-beta.2
+- **Fix: some lights did nothing and showed the wrong state (seen live: "Matan Main").** The mobile
+  protocol numbers only the physical keys of a node, the simple protocol numbers every key
+  (multi-way aliases and keys with no mobile slot included), so the two are not offset by a
+  constant. Everything is now addressed by the box's own (simple-protocol) key. Names from the
+  mobile login are attached only on nodes where the pairing is certain (same number of keys in
+  both lists and compatible kinds). On every other node the keys get generic names
+  ("Node 41 key 7") and correct control. Entities that were named from the old, wrong pairing
+  on those nodes disappear (delete the leftovers in the entity registry); renames and areas on
+  paired nodes are kept.
+- Keys that have no mobile slot at all (a fan, for example) now work and appear.
+- The first start discovers devices even with mobile credentials (needed for the pairing), then
+  caches them.
+- The one-node-per-minute safety poll no longer runs while a full state dump is streaming
+  (the box rejected those queries with error 005).
+- Excluded keys accept generic keys as `node:sN` (for example `41:s7`).
+
 ## 0.5.0-beta.1
 - **Control and live state now use the V-Box's simple protocol (port 11502): no login, no
   session limit, ~10 ms command acks and push updates.** The mobile protocol (11503) is no

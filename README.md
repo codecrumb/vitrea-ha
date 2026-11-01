@@ -111,9 +111,10 @@ Reachable from the integration's **Configure** button:
   puts each node's device in the area named after its V-Box room,
   reusing an existing area of the same name and creating one otherwise.
   Never overrides an area you set.
-- **Excluded keys** — comma-separated `node:key` pairs (0-indexed) to
-  skip when building entities, for any key that turns out to be a
-  duplicate/ghost circuit on your install.
+- **Excluded keys** — comma-separated `node:key` pairs to skip when
+  building entities, for any key that turns out to be a duplicate/ghost
+  circuit on your install. Use the 0-indexed mobile key, or `sN` for a
+  generic key (for example `41:s7` for "Node 41 key 7").
 
 ## Troubleshooting
 
@@ -188,6 +189,12 @@ and the debug log lines around the problem.
 
 - Dimmer brightness control is unverified (see above).
 - Without mobile credentials there are no names, rooms or scenes.
+- With credentials, names are attached only on nodes where the mobile and simple key lists
+  pair up with certainty. Nodes with multi-way aliases, or keys the mobile protocol does not
+  list, keep generic names ("Node 41 key 7") but control the right circuit. Rename them in
+  Home Assistant; renames survive restarts.
+- The V-Box may serve only one simple-protocol client at a time (observed once, still being
+  confirmed): don't run other scripts against port 11502 while Home Assistant is connected.
 - The simple protocol does not describe every key the way the mobile one
   does. On the author's install (217 keys) about 6 keys were never
   listed by it and about 6 lights reported only momentary button events

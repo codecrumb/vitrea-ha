@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import logging
 import re
 import threading
@@ -77,7 +78,7 @@ METADATA_PACE = 0.1
 METADATA_RELOGIN_EVERY = 60
 
 
-def _parse_excluded_keys(raw: str) -> set[tuple[int, int]]:
+def _parse_excluded_keys(raw: str) -> set[tuple[int, int | str]]:
     """Parse the `excluded_keys` option: "node:key,node:key", 0-indexed.
 
     Per-install exclusions (e.g. a key that turns out to cross-push the
@@ -92,7 +93,8 @@ def _parse_excluded_keys(raw: str) -> set[tuple[int, int]]:
             continue
         try:
             node_s, key_s = part.split(":", 1)
-            out.add((int(node_s), int(key_s)))
+            key_s = key_s.strip()
+            out.add((int(node_s), int(key_s) if key_s.isdigit() else key_s))
         except ValueError:
             _LOGGER.warning("Vitrea: ignoring malformed excluded_keys entry %r", part)
     return out
@@ -139,21 +141,28 @@ class VitreaHub:
         self._simple: SimpleVBox | None = None
         self._mobile: MobileVBox | None = None
         self._mobile_lock = threading.Lock()
-        # Keyed by (node, key): key is the 0-based slot index, which is the
-        # simple-protocol key minus one (that protocol counts from 1).
+        # Everything live is keyed by (node, simple-protocol key). That
+        # protocol numbers every key on a node (MW aliases and keys with no
+        # mobile slot included), starting at 1; the mobile protocol numbers
+        # only the physical keys, so the two are NOT offset by a constant.
+        # `_skey` maps an entity's own (node, key["key"]) to its simple key.
         self._entities: dict[tuple[int, int], object] = {}
+        self._skey: dict[tuple[int, object], int] = {}
         self._scenario_entities: dict[int, object] = {}
         self._states: dict[tuple[int, int], KeyState] = {}
         self._poll_unsub = None
         self._poll_index = 0
         self._poll_ticks = 0
         self._last_command = 0.0
+        self._last_status = 0.0
+        self._force_rediscover = False
+        self._just_discovered = False
         self._last_activity = time.monotonic()
         self._meta_count = 0
         self._metadata_listeners: list = []
         self._store = Store(hass, 1, "vitrea_metadata")
-        self._discovery_store = Store(hass, 1, "vitrea_discovery")
-        self._state_store = Store(hass, 1, "vitrea_states")
+        self._discovery_store = Store(hass, 1, "vitrea_simple_keys")
+        self._state_store = Store(hass, 1, "vitrea_simple_states")
 
     @property
     def has_mobile(self) -> bool:
@@ -189,8 +198,16 @@ class VitreaHub:
         if self._simple is not None:
             await self._simple.close()
 
-    def register_entity(self, node: int, key: int, entity) -> None:
-        self._entities[(node, key)] = entity
+    def register_entity(self, node: int, key, entity) -> None:
+        skey = self._skey.get((node, key))
+        if skey is not None:
+            self._entities[(node, skey)] = entity
+
+    def _simple_key(self, node: int, key) -> int:
+        skey = self._skey.get((node, key))
+        if skey is None:
+            raise HomeAssistantError(f"Vitrea V-Box: unknown key {key} on node {node}")
+        return skey
 
     def add_metadata_listener(self, callback) -> None:
         """Call `callback()` once the device list (self.keys/scenarios) is
@@ -209,14 +226,21 @@ class VitreaHub:
     # simple-protocol discovery dump.
     # ---------------------------------------------------------------
     async def _async_load(self) -> None:
-        keys: list[dict] = []
+        mobile: list[dict] = []
         scenarios: list[dict] = []
         if self.has_mobile:
-            keys, scenarios = await self._async_mobile_metadata()
-        if not keys:
-            keys = await self._async_discovered_keys()
+            mobile, scenarios = await self._async_mobile_metadata()
+        raw: list[dict] = []
+        for attempt in range(3):
+            raw = await self._async_discovered_raw()
+            if raw:
+                break
+            if attempt < 2:
+                await asyncio.sleep(30)
+        keys = self._merge_keys(mobile, raw)
         keys = [k for k in keys if (k["node"], k["key"]) not in self._excluded_keys]
         self.keys, self.scenarios = keys, scenarios
+        self._skey = {(k["node"], k["key"]): k["simple_key"] for k in keys}
         try:
             self._async_migrate_unique_ids()
         except Exception:
@@ -232,7 +256,8 @@ class VitreaHub:
             except Exception:
                 _LOGGER.exception("Vitrea metadata listener failed")
         self._metadata_listeners.clear()
-        await self._async_refresh_states()
+        if not self._just_discovered:
+            await self._async_refresh_states()
 
     async def _async_mobile_metadata(self) -> tuple[list[dict], list[dict]]:
         # The full scan only needs to run when the controller's config
@@ -276,6 +301,9 @@ class VitreaHub:
             if valid:
                 return cached["keys"], cached["scenarios"]
             return [], []
+        if fresh:
+            # The box's configuration changed, so the cached key list is stale too.
+            self._force_rediscover = True
         if fresh and keys and stamp is not None:
             await self._store.async_save({
                 "version": METADATA_CACHE_VERSION, "stamp": stamp,
@@ -283,8 +311,10 @@ class VitreaHub:
             })
         return keys, scenarios
 
-    async def _async_discovered_keys(self) -> list[dict]:
-        if not self._disable_metadata_cache:
+    async def _async_discovered_raw(self) -> list[dict]:
+        """Every key the box reports over the simple protocol, as
+        {"node", "key", "code"}. Cached: the dump is slow."""
+        if not (self._disable_metadata_cache or self._force_rediscover):
             try:
                 cached = await self._discovery_store.async_load()
             except Exception:
@@ -298,14 +328,15 @@ class VitreaHub:
         except Exception as err:
             _LOGGER.error("Vitrea: device discovery failed: %s", err)
             return []
-        keys = [k for k in (self._key_from_status(s) for _, s in sorted(found.items())) if k]
-        _LOGGER.info("Vitrea: discovered %d keys on %d nodes", len(keys), len({k["node"] for k in keys}))
-        if keys:
-            await self._discovery_store.async_save({"version": DISCOVERY_CACHE_VERSION, "keys": keys})
-        return keys
+        raw = [{"node": n, "key": k, "code": st.code} for (n, k), st in sorted(found.items())]
+        _LOGGER.info("Vitrea: discovered %d keys on %d nodes", len(raw), len({r["node"] for r in raw}))
+        if raw:
+            self._just_discovered = True
+            await self._discovery_store.async_save({"version": DISCOVERY_CACHE_VERSION, "keys": raw})
+        return raw
 
     @staticmethod
-    def _key_from_status(st: Status) -> dict | None:
+    def _generic_key(st: Status) -> dict | None:
         """A discovered key as a generic entity. The simple protocol has no
         names, rooms or light-vs-switch distinction, so on/off keys are
         switches (HA can show a switch as a light) and blinds are covers."""
@@ -315,16 +346,61 @@ class VitreaHub:
         }.get(st.kind)
         if ha_type is None:
             return None
-        key = st.key - 1
         return {
             "node": st.node,
-            "key": key,
-            "mobile_key": key,
+            "key": f"s{st.key}",
+            "simple_key": st.key,
             "name": f"Node {st.node} key {st.key}",
             "ha_type": ha_type,
             "dimmable": st.kind == KIND_DIMMER,
             "room": "",
         }
+
+    @staticmethod
+    def _compatible(m: dict, st: Status) -> bool:
+        if m["ha_type"] == "cover":
+            return st.kind == KIND_BLIND
+        return st.kind in (KIND_SWITCH, KIND_BOILER, KIND_DIMMER)
+
+    def _merge_keys(self, mobile: list[dict], raw: list[dict]) -> list[dict]:
+        """Entities for every discovered key, named from the mobile metadata
+        where that is safe.
+
+        The mobile protocol lists only physical keys, in order; the simple
+        protocol lists every key on the node. The two can only be paired
+        when the node has the same number of keys in both and each pair
+        has a compatible kind: then the order-preserving pairing is the
+        only possible one. Anywhere else guessing would send commands to
+        the wrong circuit, so those keys get generic names (and correct
+        control) instead.
+        """
+        simple: dict[int, list[Status]] = {}
+        for r in raw:
+            simple.setdefault(r["node"], []).append(Status(r["node"], r["key"], r["code"]))
+        named: dict[int, list[dict]] = {}
+        for m in mobile:
+            named.setdefault(m["node"], []).append(m)
+        out: list[dict] = []
+        generic_nodes: list[int] = []
+        for node in sorted(simple):
+            sk = sorted(simple[node], key=lambda st: st.key)
+            mk = sorted(named.get(node, []), key=lambda m: m["key"])
+            if mk and len(mk) == len(sk) and all(self._compatible(m, st) for m, st in zip(mk, sk)):
+                for m, st in zip(mk, sk):
+                    out.append({**m, "simple_key": st.key})
+                continue
+            if mk:
+                generic_nodes.append(node)
+            out.extend(g for g in (self._generic_key(st) for st in sk) if g)
+        if generic_nodes:
+            _LOGGER.info(
+                "Vitrea: nodes %s have keys the mobile list cannot be matched to safely; "
+                "their keys use generic names", generic_nodes,
+            )
+        missing = sorted(set(named) - set(simple))
+        if missing:
+            _LOGGER.info("Vitrea: nodes %s are named by the V-Box but not reported by it; skipped", missing)
+        return out
 
     def _start_reauth(self) -> None:
         entry = self.hass.config_entries.async_get_entry(self.entry_id) if self.entry_id else None
@@ -606,10 +682,11 @@ class VitreaHub:
     # Live state (simple protocol push)
     # ---------------------------------------------------------------
     def _on_status(self, st: Status) -> None:
+        self._last_status = time.monotonic()
         kind = st.kind
         if kind is None or kind == KIND_BUTTON:
             return  # momentary physical-key events, not state
-        slot = (st.node, st.key - 1)
+        slot = (st.node, st.key)
         prev = self._states.get(slot)
         if kind == KIND_BLIND:
             ks = KeyState(False, st.position if st.position is not None else 0)
@@ -673,6 +750,9 @@ class VitreaHub:
             await self._async_save_states()
         if time.monotonic() - self._last_command < POLL_QUIET_AFTER_COMMAND:
             return
+        # While a full dump is streaming the box rejects other queries.
+        if time.monotonic() - self._last_status < 5.0:
+            return
         nodes = sorted({n for n, _ in self._entities})
         if not nodes:
             return
@@ -691,11 +771,12 @@ class VitreaHub:
         except Exception:
             _LOGGER.debug("Vitrea: saving states failed", exc_info=True)
 
-    async def async_get_key_status(self, node: int, key: int, mobile: bool = False):
+    async def async_get_key_status(self, node: int, key, mobile: bool = False):
         """Last known state of a key (from push, a refresh, or the saved
         copy from the previous run), or None if the box has not reported it.
         """
-        return self._states.get((node, key))
+        skey = self._skey.get((node, key))
+        return self._states.get((node, skey)) if skey is not None else None
 
     # ---------------------------------------------------------------
     # Commands
@@ -712,25 +793,26 @@ class VitreaHub:
             raise HomeAssistantError("Vitrea V-Box is not connected")
         return self._simple
 
-    async def async_key_on(self, node: int, key: int, ratio: int = 0, timer: int = 0) -> None:
-        # The simple protocol counts keys from 1. ratio 254 is the app's
-        # "restore last level" sentinel; a plain on does that on the box.
+    async def async_key_on(self, node: int, key, ratio: int = 0, timer: int = 0) -> None:
+        # ratio 254 is the app's "restore last level" sentinel; a plain on
+        # does that on the box.
+        skey = self._simple_key(node, key)
         if ratio and ratio != 254:
-            await self._async_command(self._link().dimmer(node, key + 1, ratio))
+            await self._async_command(self._link().dimmer(node, skey, ratio))
         else:
-            await self._async_command(self._link().key_on(node, key + 1))
+            await self._async_command(self._link().key_on(node, skey))
 
-    async def async_key_off(self, node: int, key: int, timer: int = 0) -> None:
-        await self._async_command(self._link().key_off(node, key + 1))
+    async def async_key_off(self, node: int, key, timer: int = 0) -> None:
+        await self._async_command(self._link().key_off(node, self._simple_key(node, key)))
 
-    async def async_boiler_on(self, node: int, key: int) -> None:
-        await self._async_command(self._link().key_on(node, key + 1))
+    async def async_boiler_on(self, node: int, key) -> None:
+        await self._async_command(self._link().key_on(node, self._simple_key(node, key)))
 
-    async def async_set_cover_position(self, node: int, key: int, ratio: int) -> None:
-        await self._async_command(self._link().blind_position(node, key + 1, ratio))
+    async def async_set_cover_position(self, node: int, key, ratio: int) -> None:
+        await self._async_command(self._link().blind_position(node, self._simple_key(node, key), ratio))
 
-    async def async_stop_cover(self, node: int, key: int) -> None:
-        await self._async_command(self._link().blind_stop(node, key + 1))
+    async def async_stop_cover(self, node: int, key) -> None:
+        await self._async_command(self._link().blind_stop(node, self._simple_key(node, key)))
 
     async def async_trigger_scenario(self, scenario_id: int) -> None:
         await self._async_command(self._link().scenario(scenario_id))
