@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.0
+## 0.5.0-beta.1
 - **Control and live state now use the V-Box's simple protocol (port 11502): no login, no
   session limit, ~10 ms command acks and push updates.** The mobile protocol (11503) is no
   longer held open, which removes the reconnect/dropped-session problems and means the phone
@@ -17,6 +17,8 @@
   known states are saved across restarts. One node is re-read per minute as a safety net.
 - Dimmer levels are sent with the simple protocol's dimmer command, which is unverified on
   hardware. Please report if you have a dimmer.
+- Known gap (beta): the simple protocol omits or only button-reports a few keys (about 12 of
+  217 on the author's box). They are missing without mobile credentials; please report any.
 - Fix-ups in the options form: mobile user/password can be added or changed later.
 
 ## 0.4.1

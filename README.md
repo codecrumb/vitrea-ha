@@ -86,9 +86,18 @@ folder from this repo) and copy it to
   you're not sure, try `vitrea2` and leave `vitrea1` free). You can add
   these later under **Configure**.
 
-The first start discovers your devices, which takes a few minutes on a
-large install (the box answers about two keys a second). Entities
-appear when it finishes; later starts use the cache.
+**First start only:** the integration discovers your devices, which takes
+a few minutes on a large install (the box reports about 1.5 keys a
+second; roughly 2.5 minutes for 217 keys). Entities appear when it
+finishes. The device list is then cached, so later starts show your
+entities immediately.
+
+**After every restart:** the last known states are shown at once, and the
+integration asks the box to re-report everything, which takes the same
+couple of minutes in the background. A light or blind that was changed
+while Home Assistant was off can show its old state until the box gets to
+it, so give it about 3 minutes after a restart before trusting every
+state. Live changes are instant either way.
 
 ### Options
 
@@ -147,8 +156,8 @@ unavailable meanwhile, and states are re-read when it is back.
 
 State arrives by push. One node per minute is re-read as a safety net.
 After a restart, states shown are the last saved ones until the box has
-re-sent them (a couple of minutes on a large install). If it stays
-wrong, open an issue with debug logs.
+re-sent them (about 3 minutes on a large install, see above). If it
+stays wrong after that, open an issue with debug logs.
 
 ### Commands fail
 
@@ -179,6 +188,12 @@ and the debug log lines around the problem.
 
 - Dimmer brightness control is unverified (see above).
 - Without mobile credentials there are no names, rooms or scenes.
+- The simple protocol does not describe every key the way the mobile one
+  does. On the author's install (217 keys) about 6 keys were never
+  listed by it and about 6 lights reported only momentary button events
+  (no on/off state), so without mobile credentials those do not appear,
+  and with credentials the second group may not show live state. If a
+  light is missing or stuck, please open an issue with its node and key.
 - Air conditioning and timer scenarios exist in the Vitrea app but are
   not supported here.
 - This is a reverse-engineered protocol client, not an officially
