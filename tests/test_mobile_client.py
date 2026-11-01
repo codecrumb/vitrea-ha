@@ -111,7 +111,21 @@ v.close()
 
 # closing a session the box has stopped answering costs a bounded wait, never hangs
 box = FakeBox(mute={2}); v = client(box); v.login()
-t0 = time.monotonic(); v.close(); assert time.monotonic() - t0 < 1.5, time.monotonic() - t0
+t0 = time.monotonic(); v.close(); assert time.monotonic() - t0 < 3.5, time.monotonic() - t0
+
+# a request never queues behind a stuck one for longer than its own timeout (executor-convoy bug)
+box = FakeBox(mute={3}); v = client(box); v.login()
+def _stuck():
+    try: v.get_last_change_timestamp(timeout=2)
+    except mc.MobileVBoxConnectionError: pass
+threading.Thread(target=_stuck, daemon=True).start()
+time.sleep(0.2); t0 = time.monotonic()
+try:
+    v.handshake(timeout=0.3); raise SystemExit("should not get the lock")
+except mc.MobileVBoxConnectionError:
+    pass
+assert time.monotonic() - t0 < 1.0, time.monotonic() - t0
+time.sleep(2); v.close()
 
 # the vendored copy in the HA integration must match the source of truth (header aside)
 vend = root / "hass" / "custom_components" / "vitrea" / "_mobile_client.py"

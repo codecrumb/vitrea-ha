@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+import asyncio
 import re
 import threading
 import time
@@ -90,6 +91,13 @@ YOUNG_SESSION = 30.0
 LONG_SESSION = 60.0
 BACKOFF_STEPS = (0.0, 0.0, 5.0, 15.0, 30.0, 60.0)
 STATUS_CACHE_TTL = 5.0
+# Reads (initial entity state, polls, post-reconnect refresh) are short and
+# few at a time. On a muted session ~200 entities each waiting a 10 s timeout
+# behind one send lock starved Home Assistant's executor and froze its API
+# (seen live 2026-11-01), so a read never waits long and, once the session
+# is known bad, fails instantly until a ping or a login proves it is back.
+READ_TIMEOUT = 3.0
+READ_CONCURRENCY = 3
 METADATA_CACHE_VERSION = 2
 METADATA_PACE = 0.1
 METADATA_RELOGIN_EVERY = 60
@@ -176,6 +184,12 @@ class VitreaHub:
         self._young_deaths = 0
         self._last_login = float("-inf")
         self._bg_reconnecting = False
+        self._pinging = False
+        # False from the first sign of a dead/mute session until a ping or
+        # a fresh login succeeds. Reads fail fast while it is False.
+        self._healthy = True
+        self._node_locks: dict[int, threading.Lock] = {}
+        self._read_sem = asyncio.Semaphore(READ_CONCURRENCY)
         self.controller_version: str | None = None
         # Scenario enable flags (op 66), refreshed by the slow poll.
         self.scenario_enabled: dict[int, bool] = {}
@@ -555,6 +569,7 @@ class VitreaHub:
             self._epoch += 1
             self._session_started = time.monotonic()
             self.controller_version = getattr(m, "controller_version", None) or self.controller_version
+            self._healthy = True
             self.available = True
 
     def _on_push(self, push) -> None:
@@ -659,6 +674,8 @@ class VitreaHub:
     def _poll_nodes(self, nodes: list[int]) -> dict:
         out = {}
         for node in nodes:
+            if not self._healthy:
+                break
             for key, ks in self._node_status(node, fresh=True).items():
                 out[(node, key)] = ks
             time.sleep(0.25)
@@ -671,6 +688,8 @@ class VitreaHub:
             try:
                 snap = await self.hass.async_add_executor_job(self._node_status, node)
             except Exception:
+                if not self._healthy:
+                    break  # the box is mute again; don't try 40 more nodes
                 continue
             for (n, key), entity in list(self._entities.items()):
                 if n == node and key in snap:
@@ -681,14 +700,24 @@ class VitreaHub:
         shared for STATUS_CACHE_TTL seconds so e.g. 100 entities loading
         at once (or after a reconnect) don't each cost a request.
         """
-        now = time.monotonic()
-        hit = self._status_cache.get(node)
-        if hit is not None and not fresh and now - hit[0] < STATUS_CACHE_TTL:
-            return hit[1]
-        self._last_activity = now
-        snap = {ks.key: ks for ks in self._mobile.get_all_key_status(node)}
-        self._status_cache[node] = (time.monotonic(), snap)
-        return snap
+        lock = self._node_locks.setdefault(node, threading.Lock())
+        # One read per node at a time: the others wait here and then find the
+        # fresh cache entry instead of each sending the same request.
+        with lock:
+            now = time.monotonic()
+            hit = self._status_cache.get(node)
+            if hit is not None and not fresh and now - hit[0] < STATUS_CACHE_TTL:
+                return hit[1]
+            if not self._healthy:
+                raise MobileVBoxConnectionError("session is not healthy, not reading")
+            try:
+                snap = {ks.key: ks for ks in self._mobile.get_all_key_status(node, timeout=READ_TIMEOUT)}
+            except (MobileVBoxConnectionError, OSError):
+                self._healthy = False
+                raise
+            self._last_activity = time.monotonic()
+            self._status_cache[node] = (time.monotonic(), snap)
+            return snap
 
     async def _async_keepalive_tick(self, _now) -> None:
         if self._mobile is None:
@@ -698,18 +727,28 @@ class VitreaHub:
             self._young_deaths = 0
         if not self.available or self._bg_reconnecting:
             return
-        if time.monotonic() - self._last_activity < KEEPALIVE_IDLE:
+        if self._pinging:
+            return
+        if self._healthy and self._mobile._sock is not None and time.monotonic() - self._last_activity < KEEPALIVE_IDLE:
             return
         epoch = self._epoch
+        self._pinging = True
         try:
+            if self._mobile._sock is None:
+                raise MobileVBoxConnectionError("socket closed")
             await self.hass.async_add_executor_job(self._mobile.get_last_change_timestamp, KEEPALIVE_TIMEOUT)
             self._last_activity = time.monotonic()
+            self._healthy = True
+            return
         except Exception as err:
+            self._healthy = False
             _LOGGER.warning(
                 "Vitrea session unresponsive after %.0fs (%s), reconnecting",
                 age, err,
             )
-            await self._async_background_reconnect(epoch)
+        finally:
+            self._pinging = False
+        await self._async_background_reconnect(epoch)
 
     def _reconnect_with_backoff(self, seen_epoch: int | None = None, deadline: float | None = None) -> None:
         # The box can hold the old session slot for a few seconds after a
@@ -759,7 +798,8 @@ class VitreaHub:
         keepalive/watchdog, and the state refresh that follows covers
         whatever this read missed.
         """
-        self._last_activity = time.monotonic()
+        if not self._healthy:
+            raise MobileVBoxConnectionError("session is not healthy, not reading")
         return fn()
 
     def _run_command(self, slot: tuple, seq: int, issued: float, send):
@@ -785,7 +825,7 @@ class VitreaHub:
         try:
             return send(COMMAND_TIMEOUT)
         except (MobileVBoxConnectionError, OSError):
-            pass
+            self._healthy = False
         check()
         self._reconnect_with_backoff(epoch, deadline)
         check()
@@ -974,10 +1014,12 @@ class VitreaHub:
         try:
             slot = key if mobile else self._mk(node, key)
             # A verify-after-command read must be fresh; initial entity
-            # loads share one request per node.
-            snap = await self.hass.async_add_executor_job(
-                self._call, lambda: self._node_status(node, fresh=mobile)
-            )
+            # loads share one request per node. Only a few at a time, so a
+            # muted box can't pin the whole executor.
+            async with self._read_sem:
+                snap = await self.hass.async_add_executor_job(
+                    self._call, lambda: self._node_status(node, fresh=mobile)
+                )
             return snap.get(slot)
         except Exception:
             return None

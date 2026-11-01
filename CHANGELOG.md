@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.1
+- Fix: Home Assistant could freeze (UI spinning, API hanging) when the V-Box went mute. Entity
+  state reads piled up behind one send lock and exhausted Home Assistant's thread pool. Requests
+  now never wait longer than their own timeout, reads fail instantly while the session is known
+  bad, are de-duplicated per node and capped, and the keepalive allows one ping in flight.
+
 ## 0.4.0
 - Rooms as areas now also applies to existing devices (never overrides an area you set).
 - Wrong password is reported as such (invalid auth) instead of "cannot connect"; a rejected

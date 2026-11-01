@@ -320,19 +320,36 @@ class MobileVBox:
         if self._sock is None:
             raise MobileVBoxConnectionError("not connected")
         expect = expect if expect is not None else {opcode, OP_ACK}
-        with self._send_lock:
+        wait = timeout if timeout is not None else self.read_timeout
+        # Only one request can be in flight, but never queue behind another
+        # thread for longer than this request's own timeout: on a muted
+        # session a convoy of waiters each burning a full timeout starved
+        # Home Assistant's whole executor (seen live 2026-11-01).
+        if not self._send_lock.acquire(timeout=wait):
+            raise MobileVBoxConnectionError(f"timeout waiting to send opcode {opcode}")
+        try:
+            sock = self._sock
+            if sock is None:  # closed while we waited for the lock
+                raise MobileVBoxConnectionError("not connected")
             msg_id = self._next_msg_id()
             frame = _frame(opcode, msg_id, payload)
             ev = threading.Event()
             result: list = []
             with self._awaiting_lock:
                 self._awaiting = {"opcodes": expect, "event": ev, "result": result}
-            self._sock.sendall(frame)
-            if not ev.wait(timeout=timeout if timeout is not None else self.read_timeout):
+            try:
+                sock.sendall(frame)
+            except OSError as err:
+                with self._awaiting_lock:
+                    self._awaiting = None
+                raise MobileVBoxConnectionError(f"send failed: {err}") from err
+            if not ev.wait(timeout=wait):
                 with self._awaiting_lock:
                     self._awaiting = None
                 raise MobileVBoxConnectionError(f"timeout waiting for response to opcode {opcode}")
             return result[0]
+        finally:
+            self._send_lock.release()
 
     def _recv_frame(self) -> tuple[int, bytes]:
         assert self._sock is not None
@@ -494,14 +511,14 @@ class MobileVBox:
             raise MobileVBoxError(f"get_scenario_name {number} failed: opcode={opcode}")
         return p[2 : 2 + p[1]].decode("utf-16-le", errors="replace")
 
-    def get_all_key_status(self, node_no: int) -> list[KeyStatusPush]:
+    def get_all_key_status(self, node_no: int, timeout: float | None = None) -> list[KeyStatusPush]:
         """Fetch current status of every key on a node (opcode 52).
 
         Returns KeyStatusPush entries with 1-indexed key numbers (see
         _parse_all_key_status docstring) — use this for initial state
         load; live changes arrive via add_push_callback instead.
         """
-        opcode, payload = self._send(OP_GET_ALL_KEY_STATUS, bytes([node_no]))
+        opcode, payload = self._send(OP_GET_ALL_KEY_STATUS, bytes([node_no]), timeout=timeout)
         if opcode != OP_GET_ALL_KEY_STATUS:
             raise MobileVBoxError(f"unexpected opcode {opcode}")
         return self._parse_all_key_status(payload)

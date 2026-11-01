@@ -23,7 +23,7 @@ class KS:
     def __init__(s,node,key,on): s.node,s.key,s.is_on,s.ratio=node,key,on,0
 class FakeMobile:
     def __init__(s): s.calls=[]; s.ts=b"\x01\x02"; s._sock=object(); s.fail_ping=False
-    def get_all_key_status(s,n): s.calls.append(("all",n)); return [KS(n,0,True),KS(n,1,False)]
+    def get_all_key_status(s,n,timeout=None): s.calls.append(("all",n)); return [KS(n,0,True),KS(n,1,False)]
     def handshake(s,timeout=None): s.calls.append(("hs",))
     def get_last_change_timestamp(s,timeout=None):
         s.calls.append(("ts",)); s.last_ts_timeout=timeout
@@ -66,7 +66,7 @@ async def main():
         def __init__(s,node,key,on,ratio): super().__init__(node,key,on); s.ratio=ratio
     captured=[]; hub.async_call_later=lambda hass,delay,fn:(captured.append(fn),lambda:None)[1]
     for status,expect in (([KS2(5,0,False,40)],[(False,40)]), ([KS2(5,0,True,0)],[])):
-        h=mk(); h._mobile.get_all_key_status=lambda n,status=status:status
+        h=mk(); h._mobile.get_all_key_status=lambda n,timeout=None,status=status:status
         seen=[]; h._entities={(5,0):types.SimpleNamespace(_position=100,on_push_state=lambda on,r:seen.append((on,r)))}
         captured.clear(); h._schedule_verify(5,0); assert len(captured)==1
         await captured[0](None); assert seen==expect,(status,seen)
@@ -267,5 +267,30 @@ async def main():
     h._async_apply_rooms_as_areas()
     assert sorted(devs.upd)==sorted([("node_1","a-kitchen"),("node_2","a-Hall")]) and areas.made==["Hall"], (devs.upd,areas.made)
     h=hub.VitreaHub(Hass(),{"host":"x"},{},"E1"); h.keys=[{"node":1,"room":"Kitchen"}]; devs.upd.clear(); h._async_apply_rooms_as_areas(); assert devs.upd==[]
+    # an unhealthy session: reads fail instantly without touching the socket (no executor convoy)
+    h=mk(); h._healthy=False
+    assert await h.async_get_key_status(5,0) is None and h._mobile.calls==[]
+    # a read that times out marks the session unhealthy, so the next reads of other nodes don't each wait
+    h=mk()
+    def hang(n,timeout=None): raise MobileVBoxConnectionError("timeout")
+    h._mobile.get_all_key_status=hang
+    assert await h.async_get_key_status(5,0) is None and h._healthy is False
+    h._mobile.calls.clear(); assert await h.async_get_key_status(6,0) is None and h._mobile.calls==[]
+    # concurrent first reads of one node send ONE request (200 entities loading at once)
+    import threading as th
+    h=mk(); out=[]
+    ts=[th.Thread(target=lambda: out.append(h._node_status(5))) for _ in range(30)]
+    [t.start() for t in ts]; [t.join() for t in ts]
+    assert h._mobile.calls.count(("all",5))==1 and len(out)==30, h._mobile.calls
+    # the keepalive never stacks pings: one in flight blocks the next tick
+    h=mk(); h._last_activity-=100; h._pinging=True
+    await h._async_keepalive_tick(None); assert h._mobile.calls==[]
+    # a closed client (socket gone) goes straight to reconnect, no ping on a dead object
+    h=mk(); h._mobile._sock=None; rec=[]
+    async def fake_bg(epoch): rec.append(epoch); return True
+    h._async_background_reconnect=fake_bg
+    await h._async_keepalive_tick(None); assert rec==[h._epoch] and h._mobile.calls==[] and h._healthy is False
+    # a good ping restores health
+    h=mk(); h._healthy=False; await h._async_keepalive_tick(None); assert h._healthy is True and ("ts",) in h._mobile.calls
     print("all hub tests passed")
 asyncio.run(main())
