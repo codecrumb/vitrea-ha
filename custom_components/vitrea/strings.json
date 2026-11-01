@@ -3,12 +3,11 @@
     "step": {
       "user": {
         "title": "Connect to your Vitrea V-Box",
-        "description": "Uses the V-Box's mobile (app) protocol. Pick a mobile account slot (vitrea1-vitrea8) that no phone is currently using.",
+        "description": "Leave the host empty to find the V-Box on your network automatically. Mobile credentials are optional: without them devices are named \"Node N key K\"; with them you also get names, rooms and scenes (use an account slot, vitrea1-vitrea8, that no phone is using).",
         "data": {
-          "host": "Host (V-Box IP address)",
-          "mobile_port": "Mobile port",
-          "mobile_user": "Mobile user (vitrea1-vitrea8)",
-          "mobile_password": "Mobile password"
+          "host": "Host (V-Box IP address, optional)",
+          "mobile_user": "Mobile user (optional)",
+          "mobile_password": "Mobile password (optional)"
         }
       },
       "reauth_confirm": {
@@ -17,11 +16,20 @@
         "data": {
           "mobile_password": "Mobile password"
         }
+      },
+      "pick": {
+        "title": "Choose your V-Box",
+        "description": "More than one V-Box answered.",
+        "data": {
+          "host": "V-Box"
+        }
       }
     },
     "error": {
-      "cannot_connect": "Could not connect or log in. Check the IP, port, account and password, and that no other device is logged in with this account.",
-      "invalid_auth": "The V-Box rejected the account or password. Check the mobile user and password."
+      "cannot_connect": "Could not reach the V-Box on its control port (11502). Check the IP address and that the V-Box is on the same network.",
+      "cannot_connect_mobile": "The V-Box was found, but the mobile login failed to connect. Check that no other device is logged in with this account, or clear the mobile fields.",
+      "invalid_auth": "The V-Box rejected the mobile user or password.",
+      "no_vbox_found": "No V-Box found on your network. Enter its IP address."
     },
     "abort": {
       "already_configured": "This V-Box is already configured.",
@@ -33,16 +41,24 @@
       "init": {
         "title": "Vitrea V-Box options",
         "data": {
+          "mobile_user": "Mobile user (optional)",
+          "mobile_password": "Mobile password (optional)",
           "disable_metadata_cache": "Rescan device on every startup",
           "excluded_keys": "Excluded keys",
           "use_rooms_as_areas": "Use V-Box rooms as areas"
         },
         "data_description": {
-          "disable_metadata_cache": "Skip the metadata cache. Turn on, click Reload, then turn off again to force a one-off rescan.",
+          "mobile_user": "Add mobile credentials to get names, rooms and scenes.",
+          "mobile_password": "Leave empty for generic \"Node N key K\" names.",
+          "disable_metadata_cache": "Skip the device-list cache. Turn on, click Reload, then turn off again to force a one-off rescan.",
           "excluded_keys": "Comma-separated node:key pairs (0-indexed) to skip, e.g. 12:3,40:0",
           "use_rooms_as_areas": "Put each node's device in the area named after its V-Box room (existing areas of the same name are reused, others are created). Never overrides an area you set yourself."
         }
       }
+    },
+    "error": {
+      "invalid_auth": "The V-Box rejected the mobile user or password.",
+      "cannot_connect_mobile": "The V-Box was found, but the mobile login failed to connect. Check that no other device is logged in with this account, or clear the mobile fields."
     }
   }
 }

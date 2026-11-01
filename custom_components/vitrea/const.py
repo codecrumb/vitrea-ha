@@ -1,9 +1,11 @@
 DOMAIN = "vitrea"
 
+CONF_SIMPLE_PORT = "simple_port"
 CONF_MOBILE_PORT = "mobile_port"
 CONF_MOBILE_USER = "mobile_user"
 CONF_MOBILE_PASSWORD = "mobile_password"
 
+DEFAULT_SIMPLE_PORT = 11502
 DEFAULT_MOBILE_PORT = 11503
 DEFAULT_MOBILE_USER = "vitrea2"
 

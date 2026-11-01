@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.5.0
+- **Control and live state now use the V-Box's simple protocol (port 11502): no login, no
+  session limit, ~10 ms command acks and push updates.** The mobile protocol (11503) is no
+  longer held open, which removes the reconnect/dropped-session problems and means the phone
+  app and Home Assistant no longer kick each other off.
+- **Zero-config setup:** the host is optional (leave it empty and the integration scans your
+  network for a V-Box), and mobile credentials are optional. Without them every device is
+  discovered from the box and named "Node N key K" (on/off keys are switches, blinds are
+  covers); with them you still get names, rooms, types and scenes, via a short login that is
+  closed again.
+- Existing installs keep working unchanged (same unique IDs, same credentials). Scenes and
+  scenario enable switches still need mobile credentials: the simple protocol cannot list
+  scenarios.
+- Device list is cached after the first discovery (a few minutes on a large install). Last
+  known states are saved across restarts. One node is re-read per minute as a safety net.
+- Dimmer levels are sent with the simple protocol's dimmer command, which is unverified on
+  hardware. Please report if you have a dimmer.
+- Fix-ups in the options form: mobile user/password can be added or changed later.
+
 ## 0.4.1
 - Fix: Home Assistant could freeze (UI spinning, API hanging) when the V-Box went mute. Entity
   state reads piled up behind one send lock and exhausted Home Assistant's thread pool. Requests

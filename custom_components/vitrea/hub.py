@@ -1,18 +1,28 @@
 from __future__ import annotations
 import logging
-import asyncio
 import re
 import threading
 import time
 from datetime import timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.event import async_call_later, async_track_time_interval
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.storage import Store
 
 from ._node_types import node_category
-from ._mobile_client import BOILER_ON_TIMER, KEY_OFF, KEY_ON, MobileVBox, MobileVBoxConnectionError
+from ._mobile_client import MobileVBox, MobileVBoxAuthError
+from ._simple_client import (
+    DEFAULT_PORT as SIMPLE_PORT,
+    KIND_BLIND,
+    KIND_BOILER,
+    KIND_BUTTON,
+    KIND_DIMMER,
+    KIND_SWITCH,
+    SimpleVBox,
+    Status,
+    VitreaError,
+)
 from .const import (
     DOMAIN,
     CONF_MOBILE_PASSWORD,
@@ -20,9 +30,12 @@ from .const import (
     CONF_MOBILE_USER,
     CONF_DISABLE_METADATA_CACHE,
     CONF_EXCLUDED_KEYS,
+    CONF_SIMPLE_PORT,
     CONF_USE_ROOMS_AS_AREAS,
     DEFAULT_DISABLE_METADATA_CACHE,
     DEFAULT_EXCLUDED_KEYS,
+    DEFAULT_MOBILE_PORT,
+    DEFAULT_MOBILE_USER,
     DEFAULT_USE_ROOMS_AS_AREAS,
 )
 
@@ -45,67 +58,24 @@ _KEY_CAT_HA: dict[int, str] = {
     15: "switch",  # Boiler
     18: "fan",     # Fan
 }
-WATCHDOG_INTERVAL = timedelta(seconds=15)
-# Safety-net resync: push is the primary source of truth, but a single
-# missed push would otherwise leave a card wrong until it is reopened.
-POLL_INTERVAL = timedelta(minutes=5)
-# The box stops answering a session when it is asked for too much (seen
-# live: sustained request bursts, e.g. a 40-node sync or ~100 per-entity
-# status reads after a reconnect, then every request times out for a
-# while). Keep background traffic minimal: push is the primary source of
-# truth, the poll is only a slow safety net, node status is shared via a
-# short cache, and an idle session gets a cheap ping so a dead one is
-# replaced before a user command hits it.
-# Measured live 2026-10-29: the box silently stops answering a session every
-# few minutes (7 dead sessions caught in ~20 min), and a normal reply takes
-# ~10 ms. Ping often enough that a dead session is replaced in the
-# background before a user command hits it, and use a short timeout for
-# pings and commands so a command that does hit a dead one stalls ~4 s
-# (timeout + reconnect) instead of ~11 s (10 s timeout + reconnect).
-# Measured live 2026-10-30 (HA disabled, probe session alone, clean network):
-# the box drops or mutes a mobile session at random, often within ~10 s of
-# login if the client stays quiet, and even a session that is pinged every
-# 4 s dies after 30-100 s. Sessions that send real requests right after
-# login live far longer, so a new session is verified with an immediate
-# request and discarded if it is dead on arrival; pings only detect deaths.
-KEEPALIVE_CHECK = timedelta(seconds=3)
-KEEPALIVE_IDLE = 5.0
-KEEPALIVE_TIMEOUT = 3.0
-COMMAND_TIMEOUT = 3.0
-LOGIN_VERIFY_TIMEOUT = 3.0
-RECONNECT_DELAYS = (0.3, 1.0, 2.0, 4.0)
-# When the box mutes sessions, a command used to queue behind the reconnect
-# lock (up to ~40 s) and then replay late, in order — lights toggling a
-# minute after the tap. Now a command lives COMMAND_MAX_AGE seconds at most,
-# gets one recovery attempt, is dropped if a newer command for the same key
-# was issued meanwhile, and otherwise fails with an error the user sees.
-COMMAND_MAX_AGE = 10.0
-# Never log in more often than this, whoever asks (command or background).
-LOGIN_MIN_GAP = 5.0
-# If the last few sessions died young the box is struggling: stop hammering
-# it with fresh logins. The wait before a *background* reconnect grows with
-# the number of young deaths in a row (a user command may still force one
-# login, subject to LOGIN_MIN_GAP). A session that lives LONG_SESSION
-# seconds clears the count.
-YOUNG_SESSION = 30.0
-LONG_SESSION = 60.0
-BACKOFF_STEPS = (0.0, 0.0, 5.0, 15.0, 30.0, 60.0)
-STATUS_CACHE_TTL = 5.0
-# Reads (initial entity state, polls, post-reconnect refresh) are short and
-# few at a time. On a muted session ~200 entities each waiting a 10 s timeout
-# behind one send lock starved Home Assistant's executor and froze its API
-# (seen live 2026-11-01), so a read never waits long and, once the session
-# is known bad, fails instantly until a ping or a login proves it is back.
-READ_TIMEOUT = 3.0
-READ_CONCURRENCY = 3
+# Live control and push state run over the V-Box's simple protocol (port
+# 11502, no login, see _simple_client). The mobile protocol (11503) is only
+# used, optionally, to read names/rooms/scenes with a short login that is
+# closed again: the box allows one session per mobile account, so a
+# persistent session would fight the phone app (and it drops sessions
+# at random, which the simple protocol does not).
+#
+# Push is the primary source of truth. Safety net: re-read one node per
+# tick (the box answers status queries at ~0.6 s per key, so a full read
+# is slow and is only done once per (re)connect).
+POLL_INTERVAL = timedelta(seconds=60)
+POLL_QUIET_AFTER_COMMAND = 10.0
+SAVE_STATES_EVERY = 10  # poll ticks
 METADATA_CACHE_VERSION = 2
+DISCOVERY_CACHE_VERSION = 1
 METADATA_PACE = 0.1
 METADATA_RELOGIN_EVERY = 60
-# Don't poll right after a command (the box serializes requests and was
-# seen to time out under load), and re-read a key once its command burst
-# settles so a fast double-click ends on the real physical state.
-POLL_QUIET_AFTER_COMMAND = 10.0
-VERIFY_DELAY = 1.5
+
 
 def _parse_excluded_keys(raw: str) -> set[tuple[int, int]]:
     """Parse the `excluded_keys` option: "node:key,node:key", 0-indexed.
@@ -128,165 +98,125 @@ def _parse_excluded_keys(raw: str) -> set[tuple[int, int]]:
     return out
 
 
-class _Superseded(Exception):
-    """A newer command for the same key replaced this one before it was sent."""
+class KeyState(NamedTuple):
+    is_on: bool
+    ratio: int
 
 
 class VitreaHub:
-    """Owns one mobile-protocol metadata snapshot and one persistent
-    mobile-protocol connection (control + live push) for a single V-Box.
+    """One V-Box: live control/push over the simple protocol, plus device
+    metadata from either the simple-protocol discovery dump (generic names)
+    or, when mobile credentials are given, the mobile protocol (names,
+    rooms, scenes).
     """
 
     def __init__(self, hass: "HomeAssistant", data: dict, options: dict | None = None,
                  entry_id: str | None = None) -> None:
         self.hass = hass
         self.entry_id = entry_id
-        self._data = data
-        self._use_areas = (options or {}).get(
-            CONF_USE_ROOMS_AS_AREAS, DEFAULT_USE_ROOMS_AS_AREAS
+        options = options or {}
+        self._host = data["host"]
+        self._simple_port = data.get(CONF_SIMPLE_PORT) or SIMPLE_PORT
+        # Credentials set in the options form win over the ones from setup.
+        self._mobile_port = data.get(CONF_MOBILE_PORT) or DEFAULT_MOBILE_PORT
+        self._mobile_user = (
+            options.get(CONF_MOBILE_USER) or data.get(CONF_MOBILE_USER) or DEFAULT_MOBILE_USER
         )
-        self._disable_metadata_cache = (options or {}).get(
+        self._mobile_password = options.get(CONF_MOBILE_PASSWORD) or data.get(CONF_MOBILE_PASSWORD) or ""
+        self._use_areas = options.get(CONF_USE_ROOMS_AS_AREAS, DEFAULT_USE_ROOMS_AS_AREAS)
+        self._disable_metadata_cache = options.get(
             CONF_DISABLE_METADATA_CACHE, DEFAULT_DISABLE_METADATA_CACHE
         )
         self._excluded_keys = _parse_excluded_keys(
-            (options or {}).get(CONF_EXCLUDED_KEYS, DEFAULT_EXCLUDED_KEYS)
+            options.get(CONF_EXCLUDED_KEYS, DEFAULT_EXCLUDED_KEYS)
         )
         self.keys: list[dict] = []
         self.scenarios: list[dict] = []
         self.available = False
         self.metadata_ready = False
-        self._mobile: MobileVBox | None = None
-        # Keyed by (node, MOBILE key index) — what push events carry.
-        self._entities: dict[tuple[int, int], object] = {}
-        # (node, admin key index) -> mobile key index; filled once
-        # metadata is ready. Entities and unique IDs keep admin indices.
-        self._mobile_key: dict[tuple[int, int], int] = {}
-        self._watchdog_unsub = None
-        self._poll_unsub = None
-        self._keepalive_unsub = None
-        self._store = Store(hass, 1, "vitrea_metadata")
-        self._last_activity = time.monotonic()
-        self._status_cache: dict[int, tuple[float, dict]] = {}
-        self._meta_count = 0
-        self._last_command = 0.0
-        # Two logins on one mobile account kill both sessions, so every
-        # reconnect goes through this lock; _epoch counts successful
-        # (re)connects so a thread that waited on the lock can see someone
-        # else already replaced the session and skip a second login.
-        self._connect_lock = threading.RLock()
-        self._epoch = 0
-        self._session_started = time.monotonic()
-        self._verify_cancel: dict[tuple[int, int], object] = {}
-        self._metadata_listeners: list = []
-        # Latest-wins bookkeeping: slot -> sequence number of the newest
-        # command issued for it (see _run_command).
-        self._cmd_seq: dict[tuple, int] = {}
-        self._young_deaths = 0
-        self._last_login = float("-inf")
-        self._bg_reconnecting = False
-        self._pinging = False
-        # False from the first sign of a dead/mute session until a ping or
-        # a fresh login succeeds. Reads fail fast while it is False.
-        self._healthy = True
-        self._node_locks: dict[int, threading.Lock] = {}
-        self._read_sem = asyncio.Semaphore(READ_CONCURRENCY)
         self.controller_version: str | None = None
-        # Scenario enable flags (op 66), refreshed by the slow poll.
         self.scenario_enabled: dict[int, bool] = {}
+        self._simple: SimpleVBox | None = None
+        self._mobile: MobileVBox | None = None
+        self._mobile_lock = threading.Lock()
+        # Keyed by (node, key): key is the 0-based slot index, which is the
+        # simple-protocol key minus one (that protocol counts from 1).
+        self._entities: dict[tuple[int, int], object] = {}
         self._scenario_entities: dict[int, object] = {}
+        self._states: dict[tuple[int, int], KeyState] = {}
+        self._poll_unsub = None
+        self._poll_index = 0
+        self._poll_ticks = 0
+        self._last_command = 0.0
+        self._last_activity = time.monotonic()
+        self._meta_count = 0
+        self._metadata_listeners: list = []
+        self._store = Store(hass, 1, "vitrea_metadata")
+        self._discovery_store = Store(hass, 1, "vitrea_discovery")
+        self._state_store = Store(hass, 1, "vitrea_states")
+
+    @property
+    def has_mobile(self) -> bool:
+        """True when mobile credentials were given (names, rooms, scenes)."""
+        return bool(self._mobile_password)
 
     async def async_setup(self) -> None:
-        # Mobile connect is fast (one login) — do that first so control/
-        # push works immediately. The admin metadata scan below is NOT
-        # awaited here: confirmed live 2026-10-25 that it takes minutes
-        # (57 nodes x ~8 keys, hundreds of sequential admin-protocol
-        # round trips) and blocking config-entry setup on it risks HA's
-        # setup-timeout cancellation outright orphaning every entity.
-        # It runs as a background task instead; platforms add their
-        # entities once it completes via add_metadata_listener below.
-        await self.hass.async_add_executor_job(self._connect_mobile)
-        self._watchdog_unsub = async_track_time_interval(
-            self.hass, self._async_watchdog_tick, WATCHDOG_INTERVAL
-        )
+        self._simple = SimpleVBox(self._host, self._simple_port)
+        self._simple.add_status_listener(self._on_status)
+        self._simple.add_connection_listener(self._on_link)
+        # Raises if the box is unreachable, so setup is retried by HA.
+        await self._simple.connect()
+        self.available = True
+        try:
+            saved = await self._state_store.async_load()
+        except Exception:
+            saved = None
+        for slot, (on, ratio) in ((saved or {}).get("states") or {}).items():
+            node, key = slot.split(",")
+            self._states[(int(node), int(key))] = KeyState(bool(on), int(ratio))
         self._poll_unsub = async_track_time_interval(
             self.hass, self._async_poll_tick, POLL_INTERVAL
         )
-        self._keepalive_unsub = async_track_time_interval(
-            self.hass, self._async_keepalive_tick, KEEPALIVE_CHECK
-        )
-        self.hass.async_create_background_task(
-            self._async_fetch_and_apply_metadata(), "vitrea_metadata_fetch"
-        )
+        # Discovery can take minutes on a big install, so it must not block
+        # config-entry setup: platforms add entities via the listeners below.
+        self.hass.async_create_background_task(self._async_load(), "vitrea_load")
 
     async def async_unload(self) -> None:
-        if self._watchdog_unsub is not None:
-            self._watchdog_unsub()
-            self._watchdog_unsub = None
         if self._poll_unsub is not None:
             self._poll_unsub()
             self._poll_unsub = None
-        if self._keepalive_unsub is not None:
-            self._keepalive_unsub()
-            self._keepalive_unsub = None
-        for cancel in self._verify_cancel.values():
-            cancel()
-        self._verify_cancel.clear()
-        if self._mobile is not None:
-            await self.hass.async_add_executor_job(self._mobile.close)
-
-    def _mk(self, node: int, key: int) -> int:
-        return self._mobile_key.get((node, key), key)
+        await self._async_save_states()
+        if self._simple is not None:
+            await self._simple.close()
 
     def register_entity(self, node: int, key: int, entity) -> None:
-        self._entities[(node, self._mk(node, key))] = entity
+        self._entities[(node, key)] = entity
 
     def add_metadata_listener(self, callback) -> None:
-        """Call `callback()` once admin metadata (self.keys/scenarios) is
+        """Call `callback()` once the device list (self.keys/scenarios) is
         ready. Each platform's async_setup_entry registers one of these
-        instead of reading hub.keys synchronously — metadata may not be
-        ready yet when platforms are set up (see async_setup above).
-        Calls back immediately if metadata is already ready.
+        instead of reading hub.keys synchronously: discovery may still be
+        running when platforms are set up. Calls back immediately if the
+        list is already ready.
         """
         if self.metadata_ready:
             callback()
         else:
             self._metadata_listeners.append(callback)
 
-    async def _async_fetch_and_apply_metadata(self) -> None:
-        # The ~90s scan only needs to run when the controller's config
-        # changed: opcode 3 returns the last-change timestamp, which is
-        # the cache key. One request instead of ~330 on a normal restart.
-        stamp = None
-        try:
-            stamp = (await self.hass.async_add_executor_job(self._mobile.get_last_change_timestamp)).hex()
-        except Exception as err:
-            _LOGGER.warning("Vitrea: could not read config timestamp: %s", err)
-        cached = None
-        if not self._disable_metadata_cache:
-            try:
-                cached = await self._store.async_load()
-            except Exception:
-                _LOGGER.exception("Vitrea: metadata cache unreadable")
-        if (
-            cached
-            and cached.get("version") == METADATA_CACHE_VERSION
-            and cached.get("keys")
-            and (stamp is None or cached.get("stamp") == stamp)
-        ):
-            self.keys, self.scenarios = cached["keys"], cached["scenarios"]
-            _LOGGER.info("Vitrea: using cached metadata (%d keys)", len(self.keys))
-        else:
-            try:
-                self.keys, self.scenarios = await self.hass.async_add_executor_job(self._fetch_metadata)
-                if self.keys and stamp is not None:
-                    await self._store.async_save({
-                        "version": METADATA_CACHE_VERSION, "stamp": stamp,
-                        "keys": self.keys, "scenarios": self.scenarios,
-                    })
-            except Exception as err:
-                _LOGGER.error("Vitrea metadata fetch failed: %s", err)
-                self.keys, self.scenarios = [], []
-        self._mobile_key = {(k["node"], k["key"]): k["mobile_key"] for k in self.keys}
+    # ---------------------------------------------------------------
+    # Device list: mobile metadata when credentials exist, else the
+    # simple-protocol discovery dump.
+    # ---------------------------------------------------------------
+    async def _async_load(self) -> None:
+        keys: list[dict] = []
+        scenarios: list[dict] = []
+        if self.has_mobile:
+            keys, scenarios = await self._async_mobile_metadata()
+        if not keys:
+            keys = await self._async_discovered_keys()
+        keys = [k for k in keys if (k["node"], k["key"]) not in self._excluded_keys]
+        self.keys, self.scenarios = keys, scenarios
         try:
             self._async_migrate_unique_ids()
         except Exception:
@@ -302,6 +232,104 @@ class VitreaHub:
             except Exception:
                 _LOGGER.exception("Vitrea metadata listener failed")
         self._metadata_listeners.clear()
+        await self._async_refresh_states()
+
+    async def _async_mobile_metadata(self) -> tuple[list[dict], list[dict]]:
+        # The full scan only needs to run when the controller's config
+        # changed: opcode 3 returns the last-change timestamp, which is
+        # the cache key.
+        cached = None
+        if not self._disable_metadata_cache:
+            try:
+                cached = await self._store.async_load()
+            except Exception:
+                _LOGGER.exception("Vitrea: metadata cache unreadable")
+        valid = bool(
+            cached and cached.get("version") == METADATA_CACHE_VERSION and cached.get("keys")
+        )
+
+        def work():
+            stamp = None
+            try:
+                stamp = self._mobile.get_last_change_timestamp().hex()
+            except Exception as err:
+                _LOGGER.warning("Vitrea: could not read config timestamp: %s", err)
+            if valid and (stamp is None or cached.get("stamp") == stamp):
+                try:
+                    self.scenario_enabled.update(self._mobile.get_scenario_statuses())
+                except Exception as err:
+                    _LOGGER.debug("Vitrea: scenario status read failed: %s", err)
+                return cached["keys"], cached["scenarios"], stamp, False
+            keys, scenarios = self._fetch_metadata()
+            return keys, scenarios, stamp, True
+
+        try:
+            keys, scenarios, stamp, fresh = await self.hass.async_add_executor_job(
+                self._mobile_job, work
+            )
+        except MobileVBoxAuthError as err:
+            _LOGGER.error("Vitrea: V-Box rejected the mobile login (%s); using generic names", err)
+            self._start_reauth()
+            return [], []
+        except Exception as err:
+            _LOGGER.error("Vitrea: reading names from the V-Box failed: %s", err)
+            if valid:
+                return cached["keys"], cached["scenarios"]
+            return [], []
+        if fresh and keys and stamp is not None:
+            await self._store.async_save({
+                "version": METADATA_CACHE_VERSION, "stamp": stamp,
+                "keys": keys, "scenarios": scenarios,
+            })
+        return keys, scenarios
+
+    async def _async_discovered_keys(self) -> list[dict]:
+        if not self._disable_metadata_cache:
+            try:
+                cached = await self._discovery_store.async_load()
+            except Exception:
+                cached = None
+            if cached and cached.get("version") == DISCOVERY_CACHE_VERSION and cached.get("keys"):
+                _LOGGER.info("Vitrea: using cached device list (%d keys)", len(cached["keys"]))
+                return cached["keys"]
+        _LOGGER.info("Vitrea: discovering devices (a few minutes on a large install)")
+        try:
+            found = await self._simple.discover()
+        except Exception as err:
+            _LOGGER.error("Vitrea: device discovery failed: %s", err)
+            return []
+        keys = [k for k in (self._key_from_status(s) for _, s in sorted(found.items())) if k]
+        _LOGGER.info("Vitrea: discovered %d keys on %d nodes", len(keys), len({k["node"] for k in keys}))
+        if keys:
+            await self._discovery_store.async_save({"version": DISCOVERY_CACHE_VERSION, "keys": keys})
+        return keys
+
+    @staticmethod
+    def _key_from_status(st: Status) -> dict | None:
+        """A discovered key as a generic entity. The simple protocol has no
+        names, rooms or light-vs-switch distinction, so on/off keys are
+        switches (HA can show a switch as a light) and blinds are covers."""
+        ha_type = {
+            KIND_SWITCH: "switch", KIND_BOILER: "switch",
+            KIND_BLIND: "cover", KIND_DIMMER: "light",
+        }.get(st.kind)
+        if ha_type is None:
+            return None
+        key = st.key - 1
+        return {
+            "node": st.node,
+            "key": key,
+            "mobile_key": key,
+            "name": f"Node {st.node} key {st.key}",
+            "ha_type": ha_type,
+            "dimmable": st.kind == KIND_DIMMER,
+            "room": "",
+        }
+
+    def _start_reauth(self) -> None:
+        entry = self.hass.config_entries.async_get_entry(self.entry_id) if self.entry_id else None
+        if entry is not None:
+            entry.async_start_reauth(self.hass)
 
     def _async_apply_rooms_as_areas(self) -> None:
         """With the "rooms as areas" option on, put each node's device in the
@@ -530,55 +558,90 @@ class VitreaHub:
         return keys, scenarios
 
     # ---------------------------------------------------------------
-    # Mobile protocol: persistent connection, control + live push.
+    # Mobile protocol: short sessions only (metadata, scenario flags).
     # ---------------------------------------------------------------
     def _connect_mobile(self) -> None:
-        with self._connect_lock:
-            if self._mobile is not None:
+        if self._mobile is not None:
+            try:
+                self._mobile.close()
+            except Exception:
+                pass
+            self._mobile = None
+        m = MobileVBox(
+            host=self._host,
+            port=self._mobile_port,
+            user=self._mobile_user,
+            password=self._mobile_password,
+        )
+        try:
+            m.connect()
+            m.login()
+            # The official app follows login with version -> super-user ->
+            # timestamp before anything else; do the same.
+            m.handshake(timeout=3.0)
+        except Exception:
+            # Don't leak a half-open session: the box allows one per account.
+            try:
+                m.close()
+            except Exception:
+                pass
+            raise
+        self._mobile = m
+        self.controller_version = getattr(m, "controller_version", None) or self.controller_version
+
+    def _mobile_job(self, fn):
+        """Run fn() on a fresh mobile login, then log out again."""
+        with self._mobile_lock:
+            self._connect_mobile()
+            try:
+                return fn()
+            finally:
                 try:
                     self._mobile.close()
                 except Exception:
                     pass
-            d = self._data
-            m = MobileVBox(
-                host=d["host"],
-                port=d[CONF_MOBILE_PORT],
-                user=d[CONF_MOBILE_USER],
-                password=d[CONF_MOBILE_PASSWORD],
-            )
-            m.add_push_callback(self._on_push)
-            self._last_login = time.monotonic()
+                self._mobile = None
+
+    # ---------------------------------------------------------------
+    # Live state (simple protocol push)
+    # ---------------------------------------------------------------
+    def _on_status(self, st: Status) -> None:
+        kind = st.kind
+        if kind is None or kind == KIND_BUTTON:
+            return  # momentary physical-key events, not state
+        slot = (st.node, st.key - 1)
+        prev = self._states.get(slot)
+        if kind == KIND_BLIND:
+            ks = KeyState(False, st.position if st.position is not None else 0)
+        elif kind == KIND_DIMMER:
             try:
-                m.connect()
-                m.login()
-                # Dead-on-arrival check: a session that answers nothing right
-                # after login is useless, so fail the connect and let the
-                # caller retry rather than trusting it. The official app
-                # follows login with version -> super-user -> timestamp
-                # before anything else; do the same.
-                m.handshake(timeout=LOGIN_VERIFY_TIMEOUT)
-            except Exception:
-                # Don't leak a half-open session: the box allows one per
-                # account and may keep treating the account as logged in.
+                level = int(st.data) if st.data is not None else 0
+            except ValueError:
+                level = 0
+            ks = KeyState(level > 0, level)
+        elif st.is_on:
+            # Plain on/off carries no level; keep the last known one so a
+            # dimmable light does not drop to 1% brightness.
+            ks = KeyState(True, prev.ratio if prev and prev.ratio else 100)
+        else:
+            ks = KeyState(False, 0)
+        self._states[slot] = ks
+        self._apply_state(self._entities.get(slot), ks)
+
+    def _on_link(self, up: bool) -> None:
+        self.available = up
+        if up:
+            _LOGGER.info("Vitrea V-Box connected")
+            if self.metadata_ready:
+                self.hass.async_create_background_task(self._async_refresh_states(), "vitrea_refresh")
+        else:
+            _LOGGER.warning("Vitrea V-Box connection lost, reconnecting")
+        for entity in list(self._entities.values()):
+            if getattr(entity, "hass", None) is not None:
                 try:
-                    m.close()
+                    entity.async_write_ha_state()
                 except Exception:
-                    pass
-                raise
-            self._mobile = m
-            self._epoch += 1
-            self._session_started = time.monotonic()
-            self.controller_version = getattr(m, "controller_version", None) or self.controller_version
-            self._healthy = True
-            self.available = True
-
-    def _on_push(self, push) -> None:
-        # Called from the mobile client's own reader thread — hop back
-        # onto the HA event loop before touching any entity.
-        self.hass.loop.call_soon_threadsafe(self._dispatch_push, push)
-
-    def _dispatch_push(self, push) -> None:
-        self._apply_state(self._entities.get((push.node, push.key)), push)
+                    _LOGGER.exception("Vitrea: refreshing availability of %s failed", entity)
 
     @staticmethod
     def _apply_state(entity, ks) -> None:
@@ -592,342 +655,85 @@ class VitreaHub:
         except Exception:
             _LOGGER.exception("Vitrea: applying state to %s failed", getattr(entity, "entity_id", entity))
 
-    async def _async_watchdog_tick(self, _now) -> None:
-        alive = self._mobile is not None and self._mobile._sock is not None
-        if alive or self._bg_reconnecting:
+    async def _async_refresh_states(self) -> None:
+        """Ask the box for every key's state; answers arrive as pushes."""
+        if self._simple is None or not self._simple.connected:
             return
-        _LOGGER.warning("Vitrea mobile connection down, reconnecting")
-        self.available = False
-        await self._async_background_reconnect(self._epoch)
-
-    async def _async_background_reconnect(self, epoch: int) -> bool:
-        """Replace a dead session when no user is waiting on it.
-
-        Single flight (the 3 s ticks must not stack up threads while a
-        backoff is running), and it waits out the young-death backoff.
-        """
-        if self._bg_reconnecting:
-            return False
-        self._bg_reconnecting = True
         try:
-            await self.hass.async_add_executor_job(self._background_reconnect, epoch)
-        except Exception as err:
-            self.available = False
-            _LOGGER.warning("Vitrea reconnect failed: %s", err)
-            return False
-        finally:
-            self._bg_reconnecting = False
-        await self._async_refresh_all_states()
-        return True
-
-    def _background_reconnect(self, seen_epoch: int) -> None:
-        self._backoff_wait(seen_epoch)
-        self._reconnect_with_backoff(seen_epoch)
-
-    def _backoff_wait(self, seen_epoch: int | None) -> None:
-        """Sleep before a background login when recent sessions died young.
-
-        Polls the epoch so that a user command which forced its own
-        reconnect meanwhile ends the wait early.
-        """
-        wait = BACKOFF_STEPS[min(self._young_deaths, len(BACKOFF_STEPS) - 1)]
-        if not wait:
-            return
-        _LOGGER.warning(
-            "Vitrea: %d sessions in a row died young, waiting %.0fs before the next login",
-            self._young_deaths, wait,
-        )
-        end = time.monotonic() + wait
-        while time.monotonic() < end:
-            if seen_epoch is not None and self._epoch != seen_epoch:
-                return
-            time.sleep(0.25)
+            await self._simple.request_all()
+        except VitreaError as err:
+            _LOGGER.debug("Vitrea: full state refresh failed: %s", err)
 
     async def _async_poll_tick(self, _now) -> None:
-        """Resync entity state from the box, one bulk request per node.
-
-        Corrects drift from missed pushes. on_push_state is only called
-        for entities whose state actually differs, so this is silent in
-        the normal case.
-        """
-        if not self.available or self._mobile is None or not self._entities:
+        """Re-read one node per tick to correct any missed push."""
+        if not self.available or self._simple is None:
             return
+        self._poll_ticks += 1
+        if self._poll_ticks % SAVE_STATES_EVERY == 0:
+            await self._async_save_states()
         if time.monotonic() - self._last_command < POLL_QUIET_AFTER_COMMAND:
             return
-        await self.async_refresh_scenario_enabled()
-        # Covers report a transient "on" while moving; only lights/
-        # switches/fans are corrected here, so only poll their nodes.
-        nodes = sorted({n for (n, _), e in self._entities.items() if hasattr(e, "_is_on")})
-        try:
-            snapshot = await self.hass.async_add_executor_job(self._poll_nodes, nodes)
-        except Exception as err:
-            _LOGGER.debug("Vitrea poll failed: %s", err)
-            return
-        for (node, key), ks in snapshot.items():
-            entity = self._entities.get((node, key))
-            if entity is None:
-                continue
-            if getattr(entity, "_is_on", ks.is_on) != ks.is_on:
-                _LOGGER.debug("Vitrea poll corrected N%s-K%s to %s", node, key, ks.is_on)
-                entity.on_push_state(ks.is_on, ks.ratio)
-
-    def _poll_nodes(self, nodes: list[int]) -> dict:
-        out = {}
-        for node in nodes:
-            if not self._healthy:
-                break
-            for key, ks in self._node_status(node, fresh=True).items():
-                out[(node, key)] = ks
-            time.sleep(0.25)
-        return out
-
-    async def _async_refresh_all_states(self) -> None:
         nodes = sorted({n for n, _ in self._entities})
-        self._status_cache.clear()
-        for node in nodes:
-            try:
-                snap = await self.hass.async_add_executor_job(self._node_status, node)
-            except Exception:
-                if not self._healthy:
-                    break  # the box is mute again; don't try 40 more nodes
-                continue
-            for (n, key), entity in list(self._entities.items()):
-                if n == node and key in snap:
-                    self._apply_state(entity, snap[key])
-
-    def _node_status(self, node: int, fresh: bool = False) -> dict:
-        """{mobile key: KeyStatusPush} for a node. One request per node,
-        shared for STATUS_CACHE_TTL seconds so e.g. 100 entities loading
-        at once (or after a reconnect) don't each cost a request.
-        """
-        lock = self._node_locks.setdefault(node, threading.Lock())
-        # One read per node at a time: the others wait here and then find the
-        # fresh cache entry instead of each sending the same request.
-        with lock:
-            now = time.monotonic()
-            hit = self._status_cache.get(node)
-            if hit is not None and not fresh and now - hit[0] < STATUS_CACHE_TTL:
-                return hit[1]
-            if not self._healthy:
-                raise MobileVBoxConnectionError("session is not healthy, not reading")
-            try:
-                snap = {ks.key: ks for ks in self._mobile.get_all_key_status(node, timeout=READ_TIMEOUT)}
-            except (MobileVBoxConnectionError, OSError):
-                self._healthy = False
-                raise
-            self._last_activity = time.monotonic()
-            self._status_cache[node] = (time.monotonic(), snap)
-            return snap
-
-    async def _async_keepalive_tick(self, _now) -> None:
-        if self._mobile is None:
+        if not nodes:
             return
-        age = time.monotonic() - self._session_started
-        if self._young_deaths and age >= LONG_SESSION:
-            self._young_deaths = 0
-        if not self.available or self._bg_reconnecting:
-            return
-        if self._pinging:
-            return
-        if self._healthy and self._mobile._sock is not None and time.monotonic() - self._last_activity < KEEPALIVE_IDLE:
-            return
-        epoch = self._epoch
-        self._pinging = True
+        node = nodes[self._poll_index % len(nodes)]
+        self._poll_index += 1
         try:
-            if self._mobile._sock is None:
-                raise MobileVBoxConnectionError("socket closed")
-            await self.hass.async_add_executor_job(self._mobile.get_last_change_timestamp, KEEPALIVE_TIMEOUT)
-            self._last_activity = time.monotonic()
-            self._healthy = True
-            return
-        except Exception as err:
-            self._healthy = False
-            _LOGGER.warning(
-                "Vitrea session unresponsive after %.0fs (%s), reconnecting",
-                age, err,
-            )
-        finally:
-            self._pinging = False
-        await self._async_background_reconnect(epoch)
+            await self._simple.request_node(node)
+        except VitreaError as err:
+            _LOGGER.debug("Vitrea: poll of node %s failed: %s", node, err)
 
-    def _reconnect_with_backoff(self, seen_epoch: int | None = None, deadline: float | None = None) -> None:
-        # The box can hold the old session slot for a few seconds after a
-        # timeout, so an immediate re-login times out too (seen live as
-        # "timeout waiting for response to opcode 1"). Back off, and never
-        # log in more often than LOGIN_MIN_GAP.
-        #
-        # seen_epoch is the session epoch the caller saw fail. If it has
-        # moved on by the time we get the lock, another thread already
-        # replaced the session — logging in again would kill that fresh
-        # session (seen live 2026-10-29 as a failed turn_off right after
-        # a keepalive reconnect).
-        #
-        # deadline (a monotonic time) is set for a user command: it must
-        # not sit behind the lock or the retry schedule past its lifetime,
-        # so it raises TimeoutError instead of waiting.
-        if not self._connect_lock.acquire(timeout=-1 if deadline is None else max(0.0, deadline - time.monotonic())):
-            raise TimeoutError("a reconnect is already in progress")
+    async def _async_save_states(self) -> None:
         try:
-            if seen_epoch is not None and self._epoch != seen_epoch:
-                # Another thread already replaced the session. The caller
-                # may have marked us unavailable before that happened;
-                # undo it, or keepalive/poll stay disabled and the next
-                # refresh writes every entity as unavailable (seen live
-                # 2026-10-29: 224 entities at once).
-                self.available = True
-                return
-            if time.monotonic() - self._session_started < YOUNG_SESSION:
-                self._young_deaths += 1
-            for attempt, delay in enumerate(RECONNECT_DELAYS):
-                wait = max(delay, LOGIN_MIN_GAP - (time.monotonic() - self._last_login))
-                if deadline is not None and time.monotonic() + wait > deadline:
-                    raise TimeoutError("the V-Box is not accepting logins right now")
-                time.sleep(wait)
-                try:
-                    self._connect_mobile()
-                    return
-                except Exception:
-                    if attempt == len(RECONNECT_DELAYS) - 1:
-                        self._young_deaths += 1
-                        raise
-        finally:
-            self._connect_lock.release()
+            await self._state_store.async_save({
+                "states": {f"{n},{k}": [s.is_on, s.ratio] for (n, k), s in self._states.items()}
+            })
+        except Exception:
+            _LOGGER.debug("Vitrea: saving states failed", exc_info=True)
 
-    def _call(self, fn):
-        """Run a read. Never reconnects: a dead session is replaced by the
-        keepalive/watchdog, and the state refresh that follows covers
-        whatever this read missed.
+    async def async_get_key_status(self, node: int, key: int, mobile: bool = False):
+        """Last known state of a key (from push, a refresh, or the saved
+        copy from the previous run), or None if the box has not reported it.
         """
-        if not self._healthy:
-            raise MobileVBoxConnectionError("session is not healthy, not reading")
-        return fn()
-
-    def _run_command(self, slot: tuple, seq: int, issued: float, send):
-        """Send one command, with a single recovery attempt.
-
-        Fail fast: the command is dropped (_Superseded) if a newer command
-        for the same slot exists, and gives up (TimeoutError) once it is
-        COMMAND_MAX_AGE old, so a muted box can never replay it late.
-        A NACK means the box answered, so only a dead/mute session
-        (timeout, closed socket) justifies the reconnect.
-        """
-        deadline = issued + COMMAND_MAX_AGE
-
-        def check() -> None:
-            if self._cmd_seq.get(slot) != seq:
-                raise _Superseded
-            if time.monotonic() > deadline:
-                raise TimeoutError("the command expired before the V-Box answered")
-
-        self._last_activity = time.monotonic()
-        epoch = self._epoch
-        check()
-        try:
-            return send(COMMAND_TIMEOUT)
-        except (MobileVBoxConnectionError, OSError):
-            self._healthy = False
-        check()
-        self._reconnect_with_backoff(epoch, deadline)
-        check()
-        return send(max(0.5, min(COMMAND_TIMEOUT, deadline - time.monotonic())))
+        return self._states.get((node, key))
 
     # ---------------------------------------------------------------
     # Commands
     # ---------------------------------------------------------------
-    def _schedule_verify(self, node: int, key: int) -> None:
-        """Re-read this key's real state once its command burst settles."""
+    async def _async_command(self, awaitable) -> None:
         self._last_command = time.monotonic()
-        slot = (node, self._mk(node, key))
-        cancel = self._verify_cancel.pop(slot, None)
-        if cancel is not None:
-            cancel()
-
-        async def _verify(_now) -> None:
-            self._verify_cancel.pop(slot, None)
-            entity = self._entities.get(slot)
-            if entity is None:
-                return
-            if hasattr(entity, "_position"):
-                # Cover: a missed push would leave the position stale. A
-                # moving blind reports a transient is_on (ignored by the
-                # entity), so this only lands once it has stopped/arrived.
-                ks = await self.async_get_key_status(*slot, mobile=True)
-                if ks is not None and not ks.is_on and entity._position != ks.ratio:
-                    entity.on_push_state(ks.is_on, ks.ratio)
-                return
-            if not hasattr(entity, "_is_on"):
-                return
-            ks = await self.async_get_key_status(*slot, mobile=True)
-            if ks is not None and entity._is_on != ks.is_on:
-                entity.on_push_state(ks.is_on, ks.ratio)
-
-        self._verify_cancel[slot] = async_call_later(self.hass, VERIFY_DELAY, _verify)
-
-    async def _async_command(self, slot: tuple, send, verify: tuple[int, int] | None = None) -> None:
-        """Run `send(timeout)` on the executor as the newest command for
-        `slot` (see _run_command). A superseded command is silently
-        dropped; any other failure reaches the user as a HomeAssistantError.
-        """
-        seq = self._cmd_seq.get(slot, 0) + 1
-        self._cmd_seq[slot] = seq
-        issued = time.monotonic()
         try:
-            await self.hass.async_add_executor_job(self._run_command, slot, seq, issued, send)
-        except _Superseded:
-            return
-        except Exception as err:
-            raise HomeAssistantError(f"Vitrea V-Box command failed: {err}") from err
-        if verify is not None:
-            self._schedule_verify(*verify)
+            await awaitable
+        except VitreaError as err:
+            raise HomeAssistantError(f"Vitrea V-Box: {err}") from err
+
+    def _link(self) -> SimpleVBox:
+        if self._simple is None:
+            raise HomeAssistantError("Vitrea V-Box is not connected")
+        return self._simple
 
     async def async_key_on(self, node: int, key: int, ratio: int = 0, timer: int = 0) -> None:
-        await self._async_command(
-            (node, self._mk(node, key)),
-            lambda t: self._mobile.set_key_status(node, self._mk(node, key), KEY_ON, ratio=ratio, timer=timer, timeout=t),
-            verify=(node, key),
-        )
+        # The simple protocol counts keys from 1. ratio 254 is the app's
+        # "restore last level" sentinel; a plain on does that on the box.
+        if ratio and ratio != 254:
+            await self._async_command(self._link().dimmer(node, key + 1, ratio))
+        else:
+            await self._async_command(self._link().key_on(node, key + 1))
 
     async def async_key_off(self, node: int, key: int, timer: int = 0) -> None:
-        await self._async_command(
-            (node, self._mk(node, key)),
-            lambda t: self._mobile.set_key_status(node, self._mk(node, key), KEY_OFF, timer=timer, timeout=t),
-            verify=(node, key),
-        )
+        await self._async_command(self._link().key_off(node, key + 1))
 
     async def async_boiler_on(self, node: int, key: int) -> None:
-        # CustomBoilers.changeState: on = status ON with timer 0xFFFF
-        # ("until switched off"); the timer is seconds for a boiler key.
-        # Unverified — no boiler circuits in the reference install.
-        await self.async_key_on(node, key, timer=BOILER_ON_TIMER)
+        await self._async_command(self._link().key_on(node, key + 1))
 
     async def async_set_cover_position(self, node: int, key: int, ratio: int) -> None:
-        # Confirmed live 2026-10-25 (docs/protocol-mobile.md "Cover model
-        # resolved"): any set_key_status call just sets a new absolute
-        # target position via ratio; the status byte doesn't encode
-        # direction. KEY_ON is used here only because set_key_status
-        # needs *some* valid status byte.
-        await self._async_command(
-            (node, self._mk(node, key)),
-            lambda t: self._mobile.set_key_status(node, self._mk(node, key), KEY_ON, ratio=ratio, timeout=t),
-            verify=(node, key),
-        )
+        await self._async_command(self._link().blind_position(node, key + 1, ratio))
 
     async def async_stop_cover(self, node: int, key: int) -> None:
-        # From the official app's own decompiled source (CustomBlinds.
-        # doSendBlindStop): mid-travel stop is KEY_OFF with ratio=255 —
-        # a sentinel outside the normal 0-100 range, distinct from a
-        # real "closed" target (ratio=0). Confirmed live 2026-10-29.
-        await self._async_command(
-            (node, self._mk(node, key)),
-            lambda t: self._mobile.set_key_status(node, self._mk(node, key), KEY_OFF, ratio=255, timeout=t),
-            verify=(node, key),
-        )
+        await self._async_command(self._link().blind_stop(node, key + 1))
 
     async def async_trigger_scenario(self, scenario_id: int) -> None:
-        await self._async_command(
-            ("scenario", scenario_id),
-            lambda t: self._mobile.trigger_scenario(scenario_id, timeout=t),
-        )
+        await self._async_command(self._link().scenario(scenario_id))
 
     def device_info(self, node: int, room: str | None = None):
         """Device registry entry for a V-Box node (a wall unit / module),
@@ -975,51 +781,20 @@ class VitreaHub:
         )
 
     # ---------------------------------------------------------------
-    # Scenario enable flags (opcode 66)
+    # Scenario enable flags (mobile protocol, opcode 66). Needs mobile
+    # credentials; each change is one short login.
     # ---------------------------------------------------------------
     def register_scenario_entity(self, scenario_id: int, entity) -> None:
         self._scenario_entities[scenario_id] = entity
 
-    async def async_refresh_scenario_enabled(self) -> None:
-        """Read every scenario's enabled flag (one request) and push the
-        values to the scenario switches that exist.
-        """
-        if not self._scenario_entities or not self.available or self._mobile is None:
-            return
+    async def async_set_scenario_enabled(self, scenario_id: int, enabled: bool) -> None:
+        if not self.has_mobile:
+            raise HomeAssistantError("Enabling or disabling scenarios needs mobile credentials")
         try:
-            statuses = await self.hass.async_add_executor_job(
-                self._call, self._mobile.get_scenario_statuses
+            await self.hass.async_add_executor_job(
+                self._mobile_job,
+                lambda: self._mobile.set_scenario_enabled(scenario_id, enabled),
             )
         except Exception as err:
-            _LOGGER.debug("Vitrea scenario status read failed: %s", err)
-            return
-        self.scenario_enabled.update(statuses)
-        for sid, entity in self._scenario_entities.items():
-            if sid in statuses and getattr(entity, "hass", None) is not None:
-                entity.on_enabled(statuses[sid])
-
-    async def async_set_scenario_enabled(self, scenario_id: int, enabled: bool) -> None:
-        await self._async_command(
-            ("scenario-enabled", scenario_id),
-            lambda t: self._mobile.set_scenario_enabled(scenario_id, enabled, timeout=t),
-        )
+            raise HomeAssistantError(f"Vitrea V-Box: {err}") from err
         self.scenario_enabled[scenario_id] = enabled
-
-    async def async_get_key_status(self, node: int, key: int, mobile: bool = False):
-        """Fetch one key's current status — used by each entity's
-        async_added_to_hass so it shows the real device state on load
-        instead of defaulting to off. Returns None on failure (entity
-        just keeps its default state and waits for the next push).
-        """
-        try:
-            slot = key if mobile else self._mk(node, key)
-            # A verify-after-command read must be fresh; initial entity
-            # loads share one request per node. Only a few at a time, so a
-            # muted box can't pin the whole executor.
-            async with self._read_sem:
-                snap = await self.hass.async_add_executor_job(
-                    self._call, lambda: self._node_status(node, fresh=mobile)
-                )
-            return snap.get(slot)
-        except Exception:
-            return None
