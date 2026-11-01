@@ -12,6 +12,7 @@ from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.storage import Store
 
 from ._node_types import node_category
+from ._admin_client import CLASS_PHYSICAL, AdminAuthError, AdminInUseError, AdminVBox
 from ._mobile_client import MobileVBox, MobileVBoxAuthError
 from ._simple_client import (
     DEFAULT_PORT as SIMPLE_PORT,
@@ -26,6 +27,8 @@ from ._simple_client import (
 )
 from .const import (
     DOMAIN,
+    CONF_ADMIN_PASSWORD,
+    CONF_ADMIN_USER,
     CONF_MOBILE_PASSWORD,
     CONF_MOBILE_PORT,
     CONF_MOBILE_USER,
@@ -33,6 +36,9 @@ from .const import (
     CONF_EXCLUDED_KEYS,
     CONF_SIMPLE_PORT,
     CONF_USE_ROOMS_AS_AREAS,
+    DEFAULT_ADMIN_PASSWORD,
+    DEFAULT_ADMIN_PORT,
+    DEFAULT_ADMIN_USER,
     DEFAULT_DISABLE_METADATA_CACHE,
     DEFAULT_EXCLUDED_KEYS,
     DEFAULT_MOBILE_PORT,
@@ -74,6 +80,24 @@ POLL_QUIET_AFTER_COMMAND = 10.0
 SAVE_STATES_EVERY = 10  # poll ticks
 METADATA_CACHE_VERSION = 2
 DISCOVERY_CACHE_VERSION = 1
+ADMIN_CACHE_VERSION = 1
+# After a node query the box streams its keys at ~0.6 s each; this much
+# silence means the node is done. Refreshing node by node, with gaps, keeps
+# the box free for commands (one full dump would block it for minutes).
+REFRESH_QUIET = 2.0
+REFRESH_NODE_MAX = 20.0
+REFRESH_GAP = 1.0
+
+# What the box calls a key (its category icon) -> Home Assistant platform.
+# Air conditioning and heating keys are not supported and are skipped.
+_ICON_HA: dict[str, str] = {
+    "Light": "light", "Dimmer": "light",
+    "Blind": "cover", "Curtain": "cover",
+    "Fan": "fan",
+    "Boiler": "switch", "Undefined": "switch", "Scenario": "switch",
+    "Audio": "switch", "TV": "switch", "Alarm": "switch",
+}
+_DEFAULT_KEY_NAME = re.compile(r"^N\d+-\d+$")
 METADATA_PACE = 0.1
 METADATA_RELOGIN_EVERY = 60
 
@@ -125,6 +149,12 @@ class VitreaHub:
             options.get(CONF_MOBILE_USER) or data.get(CONF_MOBILE_USER) or DEFAULT_MOBILE_USER
         )
         self._mobile_password = options.get(CONF_MOBILE_PASSWORD) or data.get(CONF_MOBILE_PASSWORD) or ""
+        # Admin login for the one-time device-list read. Nobody has to enter
+        # it: the vendor default is tried, and any failure just falls back.
+        self._admin_user = options.get(CONF_ADMIN_USER) or data.get(CONF_ADMIN_USER) or DEFAULT_ADMIN_USER
+        self._admin_password = (
+            options.get(CONF_ADMIN_PASSWORD) or data.get(CONF_ADMIN_PASSWORD) or DEFAULT_ADMIN_PASSWORD
+        )
         self._use_areas = options.get(CONF_USE_ROOMS_AS_AREAS, DEFAULT_USE_ROOMS_AS_AREAS)
         self._disable_metadata_cache = options.get(
             CONF_DISABLE_METADATA_CACHE, DEFAULT_DISABLE_METADATA_CACHE
@@ -163,6 +193,7 @@ class VitreaHub:
         self._store = Store(hass, 1, "vitrea_metadata")
         self._discovery_store = Store(hass, 1, "vitrea_simple_keys")
         self._state_store = Store(hass, 1, "vitrea_simple_states")
+        self._admin_store = Store(hass, 1, "vitrea_admin")
 
     @property
     def has_mobile(self) -> bool:
@@ -226,18 +257,23 @@ class VitreaHub:
     # simple-protocol discovery dump.
     # ---------------------------------------------------------------
     async def _async_load(self) -> None:
-        mobile: list[dict] = []
-        scenarios: list[dict] = []
-        if self.has_mobile:
-            mobile, scenarios = await self._async_mobile_metadata()
-        raw: list[dict] = []
-        for attempt in range(3):
-            raw = await self._async_discovered_raw()
-            if raw:
-                break
-            if attempt < 2:
-                await asyncio.sleep(30)
-        keys = self._merge_keys(mobile, raw)
+        # 1. The box's own device list over the admin protocol: exact names,
+        #    rooms, key numbers and scenarios, no discovery dump needed.
+        keys, scenarios = await self._async_admin_metadata()
+        if not keys:
+            # 2. Names from the mobile login where the pairing is certain,
+            # 3. else generic names, both on top of the simple-protocol dump.
+            mobile: list[dict] = []
+            if self.has_mobile:
+                mobile, scenarios = await self._async_mobile_metadata()
+            raw: list[dict] = []
+            for attempt in range(3):
+                raw = await self._async_discovered_raw()
+                if raw:
+                    break
+                if attempt < 2:
+                    await asyncio.sleep(30)
+            keys = self._merge_keys(mobile, raw)
         keys = [k for k in keys if (k["node"], k["key"]) not in self._excluded_keys]
         self.keys, self.scenarios = keys, scenarios
         self._skey = {(k["node"], k["key"]): k["simple_key"] for k in keys}
@@ -258,6 +294,93 @@ class VitreaHub:
         self._metadata_listeners.clear()
         if not self._just_discovered:
             await self._async_refresh_states()
+
+    def _read_admin(self) -> dict:
+        with AdminVBox(
+            self._host, port=DEFAULT_ADMIN_PORT, user=self._admin_user, password=self._admin_password
+        ) as admin:
+            return admin.read_device_list()
+
+    async def _async_admin_metadata(self) -> tuple[list[dict], list[dict]]:
+        """Entities from the box's own device list, or ([], []) if it is not
+        available (wrong password, session held by another client such as
+        Control4, firmware without it). The result is cached: a read takes
+        seconds, but there is no reason to take the admin session at every
+        start."""
+        data = None
+        if not self._disable_metadata_cache:
+            try:
+                cached = await self._admin_store.async_load()
+            except Exception:
+                cached = None
+            if cached and cached.get("version") == ADMIN_CACHE_VERSION and cached.get("data"):
+                data = cached["data"]
+        if data is None:
+            try:
+                data = await self.hass.async_add_executor_job(self._read_admin)
+            except AdminInUseError:
+                _LOGGER.info("Vitrea: the admin session is in use by another client; using other sources of names")
+                return [], []
+            except AdminAuthError:
+                _LOGGER.info(
+                    "Vitrea: the admin login was rejected (default admin/admin); set it in the options "
+                    "to get exact names. Using other sources of names"
+                )
+                return [], []
+            except Exception as err:
+                _LOGGER.info("Vitrea: could not read the device list over the admin protocol (%s)", err)
+                return [], []
+            try:
+                await self._admin_store.async_save({"version": ADMIN_CACHE_VERSION, "data": data})
+            except Exception:
+                _LOGGER.debug("Vitrea: saving the admin device list failed", exc_info=True)
+        keys, scenarios = self._keys_from_admin(data)
+        _LOGGER.info("Vitrea: device list from the box: %d keys, %d scenarios", len(keys), len(scenarios))
+        return keys, scenarios
+
+    @staticmethod
+    def _keys_from_admin(data: dict) -> tuple[list[dict], list[dict]]:
+        """Entities from an admin device list.
+
+        The simple protocol's key number is the admin key index plus one.
+        Physical keys (class 255) keep the unique-id index the mobile
+        protocol gave them (their rank among the node's physical keys), so
+        existing entities, renames and areas carry over; keys with no mobile
+        slot (class 0, for example a fan) are named by their simple key.
+        Multi-way aliases and pair keys duplicate another key and are skipped.
+        """
+        rooms = {int(k): v for k, v in data["rooms"].items()}
+        icons = {int(k): v for k, v in data["categories"].items()}
+        keys: list[dict] = []
+        for node_s, nd in sorted(data["nodes"].items(), key=lambda kv: int(kv[0])):
+            node = int(node_s)
+            rank = -1
+            for k in sorted(nd["keys"], key=lambda k: k["key"]):
+                if k["class"] == CLASS_PHYSICAL:
+                    rank += 1
+                name = (k.get("name") or "").strip()
+                lname = name.lower()
+                if lname.endswith("mw") or " pair" in lname or _DEFAULT_KEY_NAME.match(name):
+                    continue
+                icon = icons.get(k["category"], "Undefined")
+                ha_type = _ICON_HA.get(icon)
+                if ha_type is None:
+                    continue
+                skey = k["key"] + 1
+                keys.append({
+                    "node": node,
+                    "key": rank if k["class"] == CLASS_PHYSICAL else f"s{skey}",
+                    "simple_key": skey,
+                    "name": name or f"Node {node} key {skey}",
+                    "ha_type": ha_type,
+                    "dimmable": icon == "Dimmer",
+                    "room": rooms.get(k["room_no"]) or rooms.get(nd.get("room_no"), ""),
+                })
+        scenarios = [
+            {"id": sc["id"], "name": sc["name"], "listed": True, "has_status": False}
+            for sc in data.get("scenarios", [])
+        ]
+        return keys, scenarios
 
     async def _async_mobile_metadata(self) -> tuple[list[dict], list[dict]]:
         # The full scan only needs to run when the controller's config
@@ -732,14 +855,32 @@ class VitreaHub:
         except Exception:
             _LOGGER.exception("Vitrea: applying state to %s failed", getattr(entity, "entity_id", entity))
 
+    async def _async_wait_quiet(self) -> None:
+        """Wait until the box has stopped streaming status lines."""
+        start = time.monotonic()
+        while time.monotonic() - start < REFRESH_NODE_MAX:
+            await asyncio.sleep(0.25)
+            if time.monotonic() - self._last_status > REFRESH_QUIET:
+                return
+
     async def _async_refresh_states(self) -> None:
-        """Ask the box for every key's state; answers arrive as pushes."""
-        if self._simple is None or not self._simple.connected:
+        """Re-read every node's states, one node at a time with gaps. The
+        answers arrive as pushes. Commands go first: while one was sent
+        recently the refresh waits."""
+        if self._simple is None:
             return
-        try:
-            await self._simple.request_all()
-        except VitreaError as err:
-            _LOGGER.debug("Vitrea: full state refresh failed: %s", err)
+        for node in sorted({k["node"] for k in self.keys}):
+            while time.monotonic() - self._last_command < POLL_QUIET_AFTER_COMMAND:
+                await asyncio.sleep(1.0)
+            if not self._simple.connected:
+                return
+            try:
+                await self._simple.request_node(node)
+            except VitreaError as err:
+                _LOGGER.debug("Vitrea: refresh of node %s failed: %s", node, err)
+                continue
+            await self._async_wait_quiet()
+            await asyncio.sleep(REFRESH_GAP)
 
     async def _async_poll_tick(self, _now) -> None:
         """Re-read one node per tick to correct any missed push."""

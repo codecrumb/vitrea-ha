@@ -41,6 +41,8 @@
       "init": {
         "title": "Vitrea V-Box options",
         "data": {
+          "admin_user": "Admin user (only if not the default)",
+          "admin_password": "Admin password (only if not the default)",
           "mobile_user": "Mobile user (optional)",
           "mobile_password": "Mobile password (optional)",
           "disable_metadata_cache": "Rescan device on every startup",
@@ -48,6 +50,8 @@
           "use_rooms_as_areas": "Use V-Box rooms as areas"
         },
         "data_description": {
+          "admin_user": "Used once to read the exact device list. The vendor default is tried automatically.",
+          "admin_password": "Only change this if your V-Box's admin password is not the default 'admin'.",
           "mobile_user": "Add mobile credentials to get names, rooms and scenes.",
           "mobile_password": "Leave empty for generic \"Node N key K\" names.",
           "disable_metadata_cache": "Skip the device-list cache. Turn on, click Reload, then turn off again to force a one-off rescan.",

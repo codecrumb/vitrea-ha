@@ -8,12 +8,16 @@ from homeassistant.data_entry_flow import FlowResult
 
 from .const import (
     DOMAIN,
+    CONF_ADMIN_PASSWORD,
+    CONF_ADMIN_USER,
     CONF_MOBILE_PORT,
     CONF_MOBILE_USER,
     CONF_MOBILE_PASSWORD,
     CONF_DISABLE_METADATA_CACHE,
     CONF_EXCLUDED_KEYS,
     CONF_USE_ROOMS_AS_AREAS,
+    DEFAULT_ADMIN_PASSWORD,
+    DEFAULT_ADMIN_USER,
     DEFAULT_MOBILE_PORT,
     DEFAULT_MOBILE_USER,
     DEFAULT_DISABLE_METADATA_CACHE,
@@ -183,9 +187,13 @@ class VitreaOptionsFlow(config_entries.OptionsFlow):
     confirmed duplicate/ghost circuit) without editing code — it's
     per-install state, not something that belongs hardcoded in hub.py.
 
-    The mobile fields let you add (or change) credentials after setup to
-    get names, rooms and scenes; leave the password empty for generic
-    "Node N key K" names.
+    The admin fields are only needed if your V-Box's admin password is not
+    the vendor default (admin): the integration tries the default by itself
+    to read the exact device list once, and falls back if it is refused or
+    the admin session is busy (for example with Control4).
+
+    The mobile fields are a fallback source of names (and give the scenario
+    enable switches); leave the password empty to skip them.
     """
 
     async def async_step_init(self, user_input: dict | None = None) -> FlowResult:
@@ -214,6 +222,14 @@ class VitreaOptionsFlow(config_entries.OptionsFlow):
         cur_user = opts.get(CONF_MOBILE_USER) or data.get(CONF_MOBILE_USER) or DEFAULT_MOBILE_USER
         cur_pw = opts.get(CONF_MOBILE_PASSWORD) or data.get(CONF_MOBILE_PASSWORD) or ""
         schema = vol.Schema({
+            vol.Optional(
+                CONF_ADMIN_USER,
+                default=opts.get(CONF_ADMIN_USER) or DEFAULT_ADMIN_USER,
+            ): str,
+            vol.Optional(
+                CONF_ADMIN_PASSWORD,
+                default=opts.get(CONF_ADMIN_PASSWORD) or DEFAULT_ADMIN_PASSWORD,
+            ): str,
             vol.Optional(CONF_MOBILE_USER, default=cur_user): str,
             vol.Optional(CONF_MOBILE_PASSWORD, default=cur_pw): str,
             vol.Required(

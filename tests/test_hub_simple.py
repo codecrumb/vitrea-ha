@@ -44,6 +44,26 @@ sys.modules["vitrea"] = pkg
 hub_mod = importlib.import_module("vitrea.hub")
 simple = importlib.import_module("vitrea._simple_client")
 simple.DISCOVERY_QUIET = 0.3
+admin_mod = importlib.import_module("vitrea._admin_client")
+hub_mod.REFRESH_QUIET = 0.1
+hub_mod.REFRESH_GAP = 0.0
+
+
+class _AdminRejected:
+    """Default stand-in for the admin protocol: the login is refused, so the
+    hub falls back to the other sources of names."""
+
+    def __init__(self, *a, **k):
+        pass
+
+    def __enter__(self):
+        raise admin_mod.AdminAuthError("rejected")
+
+    def __exit__(self, *exc):
+        return False
+
+
+hub_mod.AdminVBox = _AdminRejected
 HomeAssistantError = sys.modules["homeassistant.exceptions"].HomeAssistantError
 
 
@@ -156,8 +176,9 @@ def test_device_list_is_cached_and_excluded_keys_apply():
         first = [k for k in box.log if k == "H:NALL:G"]
         await h.async_unload()
         h2 = await make(box, options={"excluded_keys": "1:s2"})
-        # second run: no discovery dump, only the one state refresh
-        assert len([k for k in box.log if k == "H:NALL:G"]) == len(first) + 1
+        # second run: no discovery dump, only per-node state refreshes
+        assert len([k for k in box.log if k == "H:NALL:G"]) == len(first)
+        assert "H:N001:G" in box.log and "H:N002:G" in box.log
         assert {(k["node"], k["key"]) for k in h2.keys} == {(1, "s1"), (2, "s1")}
         await h2.async_unload()
         await box.stop()
@@ -292,6 +313,156 @@ def test_poll_waits_while_a_dump_is_streaming():
         await h._async_poll_tick(None)
         await asyncio.sleep(0.1)
         assert any(line.startswith("H:N") and line.endswith(":G") for line in box.log[before:])
+        await h.async_unload()
+        await box.stop()
+    run(go())
+
+
+ADMIN_DATA = {
+    "rooms": {"1": "Kitchen", "2": "Living"},
+    "categories": {"1": "Light", "2": "Dimmer", "3": "Blind", "6": "Fan", "4": "AirConditioning"},
+    "nodes": {
+        "1": {"node": 1, "room_no": 1, "num_keys": 2, "keys": [
+            {"node": 1, "key": 0, "class": 255, "category": 1, "room_no": 1, "name": "Lamp"},
+            {"node": 1, "key": 1, "class": 255, "category": 3, "room_no": 1, "name": "Shade"},
+        ]},
+        "2": {"node": 2, "room_no": 2, "num_keys": 7, "keys": [
+            {"node": 2, "key": 0, "class": 255, "category": 3, "room_no": 2, "name": "Window"},
+            {"node": 2, "key": 1, "class": 255, "category": 3, "room_no": 2, "name": "N2-1 Pair"},
+            {"node": 2, "key": 2, "class": 255, "category": 1, "room_no": 2, "name": "Study"},
+            {"node": 2, "key": 3, "class": 0, "category": 1, "room_no": 0, "name": "Hall Sconces MW"},
+            {"node": 2, "key": 4, "class": 0, "category": 6, "room_no": 2, "name": "Ceiling Fan "},
+            {"node": 2, "key": 5, "class": 255, "category": 1, "room_no": 2, "name": "Main"},
+            {"node": 2, "key": 6, "class": 0, "category": 4, "room_no": 2, "name": "Split AC"},
+        ]},
+    },
+    "scenarios": [{"id": 10, "name": "Night light"}],
+}
+
+
+def _fake_admin(data, calls=None, error=None):
+    class FakeAdmin:
+        def __init__(self, host, port=11501, user="admin", password="admin", **k):
+            if calls is not None:
+                calls.append((host, port, user, password))
+
+        def __enter__(self):
+            if error is not None:
+                raise error
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read_device_list(self):
+            return data
+
+    return FakeAdmin
+
+
+def test_admin_list_gives_exact_names_keys_and_keeps_old_ids():
+    async def go():
+        box = FakeBox()
+        await box.start()
+        calls = []
+        hub_mod.AdminVBox = _fake_admin(ADMIN_DATA, calls)
+        try:
+            h = await make(box)
+        finally:
+            hub_mod.AdminVBox = _AdminRejected
+        assert calls and calls[0][2:] == ("admin", "admin")  # the default login, nobody typed it
+        by = {(k["node"], k["key"]): k for k in h.keys}
+        # physical keys keep their legacy id (rank among physical keys, pair counted)
+        assert by[(1, 0)]["name"] == "Lamp" and by[(1, 0)]["simple_key"] == 1 and by[(1, 0)]["ha_type"] == "light"
+        assert by[(1, 1)]["ha_type"] == "cover" and by[(1, 1)]["simple_key"] == 2
+        assert by[(2, 0)]["name"] == "Window" and by[(2, 0)]["simple_key"] == 1
+        assert by[(2, 2)]["name"] == "Study" and by[(2, 2)]["simple_key"] == 3
+        assert by[(2, 3)]["name"] == "Main" and by[(2, 3)]["simple_key"] == 6
+        # a key with no mobile slot (the fan) is included, addressed by its simple key
+        assert by[(2, "s5")]["ha_type"] == "fan" and by[(2, "s5")]["name"] == "Ceiling Fan"
+        # aliases, pair keys and AC keys are not entities
+        names = {k["name"] for k in h.keys}
+        assert not any(n in names for n in ("Hall Sconces MW", "N2-1 Pair", "Split AC"))
+        assert by[(2, 3)]["room"] == "Living" and by[(1, 0)]["room"] == "Kitchen"
+        assert h.scenarios == [{"id": 10, "name": "Night light", "listed": True, "has_status": False}]
+        # no discovery dump at all; states come from per-node queries
+        assert "H:NALL:G" not in box.log
+        assert "H:N001:G" in box.log and "H:N002:G" in box.log
+        # commands use the admin-derived simple key
+        await h.async_key_on(2, 3)
+        await h.async_key_on(2, "s5")
+        assert "H:N002:6:O:" in box.log and "H:N002:5:O:" in box.log
+        await h.async_unload()
+        await box.stop()
+    run(go())
+
+
+def test_admin_unavailable_falls_back_to_generic_names():
+    async def go():
+        for err in (admin_mod.AdminInUseError("busy"), admin_mod.AdminAuthError("bad"), OSError("refused")):
+            Store.data = {}
+            box = FakeBox()
+            await box.start()
+            hub_mod.AdminVBox = _fake_admin(ADMIN_DATA, error=err)
+            try:
+                h = await make(box)
+            finally:
+                hub_mod.AdminVBox = _AdminRejected
+            assert {(k["node"], k["key"]) for k in h.keys} == {(1, "s1"), (1, "s2"), (2, "s1")}
+            await h.async_unload()
+            await box.stop()
+    run(go())
+
+
+def test_admin_list_is_cached_between_starts():
+    async def go():
+        box = FakeBox()
+        await box.start()
+        calls = []
+        hub_mod.AdminVBox = _fake_admin(ADMIN_DATA, calls)
+        try:
+            h = await make(box)
+            await h.async_unload()
+            h2 = await make(box)  # restart: the cached list is used
+            assert len(calls) == 1
+            assert {k["name"] for k in h2.keys} >= {"Lamp", "Main", "Ceiling Fan"}
+            await h2.async_unload()
+            h3 = await make(box, options={"disable_metadata_cache": True})
+            assert len(calls) == 2  # the rescan toggle reads it again
+            await h3.async_unload()
+        finally:
+            hub_mod.AdminVBox = _AdminRejected
+        await box.stop()
+    run(go())
+
+
+def test_admin_login_from_options_is_used():
+    async def go():
+        box = FakeBox()
+        await box.start()
+        calls = []
+        hub_mod.AdminVBox = _fake_admin(ADMIN_DATA, calls)
+        try:
+            h = await make(box, options={"admin_user": "installer", "admin_password": "s3cret"})
+        finally:
+            hub_mod.AdminVBox = _AdminRejected
+        assert calls[0][2:] == ("installer", "s3cret")
+        await h.async_unload()
+        await box.stop()
+    run(go())
+
+
+def test_refresh_lets_commands_go_first():
+    async def go():
+        box = FakeBox()
+        await box.start()
+        h = await make(box)
+        before = len(box.log)
+        h._last_command = hub_mod.time.monotonic()  # a command just went out
+        t = asyncio.create_task(h._async_refresh_states())
+        await asyncio.sleep(0.3)
+        assert not any(l.endswith(":G") for l in box.log[before:])  # waiting for the command window
+        t.cancel()
         await h.async_unload()
         await box.stop()
     run(go())
