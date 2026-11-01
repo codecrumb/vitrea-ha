@@ -42,18 +42,27 @@ supported and more complete.
   any missed push
 - A device-list cache so a restart doesn't re-scan your box (see Options)
 
-### With and without mobile credentials
+### Where the names come from
 
-| | No credentials (just the IP) | With mobile credentials |
-|---|---|---|
-| Lights, switches, blinds, fans | yes | yes |
-| Names | `Node 4 key 1` | your names from the V-Box |
-| Rooms / areas | no | yes (optional) |
-| Light vs switch vs fan | everything on/off is a switch (use HA's "Show as: Light") | correct types |
-| Scenes and scenario switches | no | yes |
+Control and live state always use the V-Box's simple protocol (port
+11502), which has no names. To name your devices the integration tries,
+in this order, and uses the first that works:
 
-The simple protocol has no names, rooms or scenario list, which is why
-the mobile login is needed for those. Everything else works without it.
+1. **The box's own device list (admin protocol, port 11501).** Read once,
+   in seconds, and cached. This gives exact names, rooms, device types,
+   scenes, and also devices the phone app never lists (a fan, for
+   example). Nothing to enter: it uses the vendor-default login
+   (`admin` / `admin`). If your admin password is different, set it under
+   **Configure**. If the admin session is busy (some installs keep it
+   open, for example Control4) or the login is refused, it is skipped and
+   nothing is disturbed.
+2. **The mobile (phone app) login**, if you gave one: names and rooms for
+   the nodes where they can be matched to the right key with certainty.
+3. **Generic names** ("Node 4 key 1"; on/off keys are switches, blinds are
+   covers). Everything still works; rename entities in Home Assistant.
+
+Scenes need source 1 or 2. The scenario enable/disable switches need a
+mobile login.
 
 **Dimmers are implemented but unverified against real hardware** — the
 author's own installation has no dimmer-category circuits. **If you have
@@ -81,29 +90,32 @@ folder from this repo) and copy it to
 - **Host** *(optional)* — your V-Box's IP address. Leave it empty and
   the integration scans your local network for a V-Box (if it finds
   several you pick one).
-- **Mobile user / password** *(optional)* — for names, rooms and scenes.
-  Use one of `vitrea1`-`vitrea8`, in a slot that no phone is using (if
-  you're not sure, try `vitrea2` and leave `vitrea1` free). You can add
+- **Mobile user / password** *(optional)* — a fallback source of names,
+  and the scenario enable/disable switches. Use one of
+  `vitrea1`-`vitrea8`, in a slot that no phone is using. You can add
   these later under **Configure**.
 
-**First start only:** the integration discovers your devices, which takes
-a few minutes on a large install (the box reports about 1.5 keys a
-second; roughly 2.5 minutes for 217 keys). Entities appear when it
-finishes. The device list is then cached, so later starts show your
-entities immediately.
+Most installs need neither: the exact device list is read with the
+vendor-default admin login automatically (see "Where the names come from").
+
+**First start:** the device list is read from the box in a few seconds
+(without it, discovery takes a few minutes on a large install). It is
+cached, so later starts show your entities immediately.
 
 **After every restart:** the last known states are shown at once, and the
-integration asks the box to re-report everything, which takes the same
-couple of minutes in the background. A light or blind that was changed
-while Home Assistant was off can show its old state until the box gets to
-it, so give it about 3 minutes after a restart before trusting every
-state. Live changes are instant either way.
+integration re-reads the nodes one at a time in the background (about 3
+minutes for a large install, with pauses so commands are never stuck
+behind it). A light or blind that was changed while Home Assistant was off
+can show its old state until its node is read, so give it a few minutes
+after a restart before trusting every state. Live changes are instant
+either way.
 
 ### Options
 
 Reachable from the integration's **Configure** button:
 
-- **Mobile user / password** — add or change credentials after setup.
+- **Admin user / password** — only if your V-Box's admin password is not the default `admin`.
+- **Mobile user / password** — add or change the mobile login after setup.
 - **Rescan device on every startup** (off by default) — skips the
   cache. Turn it on, click **Reload**, then turn it back off to force a
   one-off fresh scan (e.g. after renaming something on the box).
@@ -139,13 +151,14 @@ logger:
 
 Each `vitrea1`-`vitrea8` account allows one session at a time, so if the
 phone app is logged in as the same account, give Home Assistant its own.
-A wrong password is reported as such. Without credentials the
-integration still works, with generic names.
+A wrong password is reported as such. The mobile login is optional.
 
 ### Everything shows as a switch / names are "Node N key K"
 
-That's the no-credentials mode (see the table above). Add mobile
-credentials under **Configure**, then reload.
+The exact device list could not be read. In the log you will see why:
+`the admin session is in use by another client` (close the other client,
+then reload) or `the admin login was rejected` (set your admin password
+under **Configure**, then reload). Or add a mobile login for partial names.
 
 ### The integration reconnects
 
@@ -188,19 +201,21 @@ and the debug log lines around the problem.
 ## Known limitations
 
 - Dimmer brightness control is unverified (see above).
-- Without mobile credentials there are no names, rooms or scenes.
-- With credentials, names are attached only on nodes where the mobile and simple key lists
-  pair up with certainty. Nodes with multi-way aliases, or keys the mobile protocol does not
-  list, keep generic names ("Node 41 key 7") but control the right circuit. Rename them in
-  Home Assistant; renames survive restarts.
-- The V-Box may serve only one simple-protocol client at a time (observed once, still being
-  confirmed): don't run other scripts against port 11502 while Home Assistant is connected.
-- The simple protocol does not describe every key the way the mobile one
-  does. On the author's install (217 keys) about 6 keys were never
-  listed by it and about 6 lights reported only momentary button events
-  (no on/off state), so without mobile credentials those do not appear,
-  and with credentials the second group may not show live state. If a
-  light is missing or stuck, please open an issue with its node and key.
+- If the admin list cannot be read, names fall back to the mobile login
+  (only where the mobile and simple key lists pair up with certainty),
+  then to generic names. The simple protocol cannot tell physical keys
+  from multi-way aliases, so there is no safe credential-free way to match
+  names to keys on older firmware (7.91 was tested; boxes on firmware
+  7.99 or newer, 8.63 or newer, or 9+ expose a database on port 11502 that
+  could allow this; support for that is not built).
+- The V-Box answers everything through one slow queue (about 0.6 s per
+  status line), so a full state dump blocks it for minutes. The integration
+  reads one node at a time and waits for commands; avoid running other
+  tools that request a full dump while Home Assistant is starting.
+- On the author's install, a few keys (about 6 of 217) are never listed by
+  the simple protocol and a few lights report only momentary button
+  events (no on/off state). If a light is missing or stuck, please open an
+  issue with its node and key.
 - Air conditioning and timer scenarios exist in the Vitrea app but are
   not supported here.
 - This is a reverse-engineered protocol client, not an officially

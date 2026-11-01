@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.0-beta.3
+- **Exact names again, with nothing to enter.** The box's own device list (admin protocol) is read once, cached,
+  and used first: real names, rooms, types, scenes, and devices the phone app never lists (a fan). The vendor-default
+  admin login is tried automatically; a different password goes in the options. If it is refused or the admin
+  session is busy (Control4), it is skipped without disturbing anyone and the older sources are used.
+- Physical keys keep their old entity IDs, so entities you had before beta 1 (and their renames and areas) come back.
+  Generic "Node X key Y" entities from beta 2 that now have real names are left over: delete them in the entity registry.
+- No more full state dump on restart or at first start with the admin list: states are re-read one node at a time with
+  gaps, and commands go first, so a command is never stuck behind a multi-minute dump.
+- New options: admin user / password (only if not the default).
+
 ## 0.5.0-beta.2
 - **Fix: some lights did nothing and showed the wrong state (seen live: "Matan Main").** The mobile
   protocol numbers only the physical keys of a node, the simple protocol numbers every key
