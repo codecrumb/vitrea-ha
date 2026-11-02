@@ -47,6 +47,7 @@ simple.DISCOVERY_QUIET = 0.3
 admin_mod = importlib.import_module("vitrea._admin_client")
 hub_mod.REFRESH_QUIET = 0.1
 hub_mod.REFRESH_GAP = 0.0
+hub_mod.VERIFY_DELAY = 0.1
 
 
 class _AdminRejected:
@@ -463,6 +464,35 @@ def test_refresh_lets_commands_go_first():
         await asyncio.sleep(0.3)
         assert not any(l.endswith(":G") for l in box.log[before:])  # waiting for the command window
         t.cancel()
+        await h.async_unload()
+        await box.stop()
+    run(go())
+
+
+def test_command_that_changes_nothing_still_corrects_the_state():
+    """The box reports nothing when a key is already in the commanded state
+    (seen live: the UI said off, the light was on, "on" did nothing)."""
+    async def go():
+        box = FakeBox()
+        await box.start()
+        box.quiet_noop = True
+        box.node_lines = True
+        box.state[(1, 1)] = "O"  # physically on
+        h = await make(box)
+        sw = Entity()
+        h.register_entity(1, "s1", sw)
+        h._states.pop((1, 1), None)  # Home Assistant thinks it does not know
+        before = len(box.log)
+        await h.async_key_on(1, "s1")  # the box will say nothing back
+        await asyncio.sleep(0.6)
+        assert "H:N001:G" in box.log[before:], box.log[before:]
+        assert sw.pushed and sw.pushed[-1] == (True, 100), sw.pushed
+        # a command that does change the state needs no re-read
+        before = len(box.log)
+        await h.async_key_off(1, "s1")
+        await asyncio.sleep(0.6)
+        assert "H:N001:G" not in box.log[before:], box.log[before:]
+        assert sw.pushed[-1] == (False, 0)
         await h.async_unload()
         await box.stop()
     run(go())

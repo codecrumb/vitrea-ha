@@ -106,8 +106,9 @@ cached, so later starts show your entities immediately.
 integration re-reads the nodes one at a time in the background (about 3
 minutes for a large install, with pauses so commands are never stuck
 behind it). A light or blind that was changed while Home Assistant was off
-can show its old state until its node is read, so give it a few minutes
-after a restart before trusting every state. Live changes are instant
+can show its old state until its node is read (on a first start with no
+saved states, entities show "unknown" until their node is read), so give it a
+few minutes after a restart before trusting every state. Live changes are instant
 either way.
 
 ### Options

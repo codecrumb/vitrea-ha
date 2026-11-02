@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.0-beta.4
+- Fix: a light that was already on could show as off after a (re)start and then ignore "on" (the box says
+  nothing back when a key is already in the commanded state). Entities now show **unknown**, not off, until the
+  box has reported their state, and a command that gets no state report makes the integration re-read that
+  node, so the display corrects itself within a couple of seconds.
+- Reminder: on the very first start the box needs a few minutes to report every state (it answers about
+  1.5 keys a second), so some entities stay "unknown" for that long.
+
 ## 0.5.0-beta.3
 - **Exact names again, with nothing to enter.** The box's own device list (admin protocol) is read once, cached,
   and used first: real names, rooms, types, scenes, and devices the phone app never lists (a fan). The vendor-default

@@ -24,6 +24,8 @@ class FakeBox:
         self.state = {(1, 1): "F", (1, 2): "B:100", (2, 1): "O"}
         self.log = []
         self.mute = False  # swallow everything, like a wedged box
+        self.quiet_noop = False  # like the real box: no report when a key is already in that state
+        self.node_lines = False  # answer a node query with its keys' states
         self.writers = []
         self.server = None
         self.port = None
@@ -63,6 +65,11 @@ class FakeBox:
                     await asyncio.sleep(0.02)
             elif line.startswith("H:N") and line.endswith(":G"):
                 self.push(w, "OK")
+                if self.node_lines:
+                    node = int(line[3:6])
+                    for (n, k), v in sorted(self.state.items()):
+                        if n == node:
+                            self.push(w, f"S:N{n:03d}:{k}:{v}")
             elif line.startswith("H:N"):
                 p = line.split(":")
                 n, k, act = int(p[1][1:]), int(p[2]), p[3]
@@ -73,8 +80,10 @@ class FakeBox:
                 else:
                     self.push(w, "OK")
                     if act in ("O", "F"):
+                        changed = self.state.get((n, k)) != act
                         self.state[(n, k)] = act
-                        self.push(w, f"S:N{n:03d}:{k}:{act}")
+                        if changed or not self.quiet_noop:
+                            self.push(w, f"S:N{n:03d}:{k}:{act}")
                     elif act == "B" and p[4] != "255":
                         self.state[(n, k)] = f"B:{p[4]}"
                         self.push(w, f"S:N{n:03d}:{k}:B:{p[4]}")

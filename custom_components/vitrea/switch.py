@@ -33,7 +33,8 @@ class VitreaSwitch(SwitchEntity):
         self._attr_name = key["name"]
         self._attr_unique_id = f"vitrea_{self._node}_{self._key}"
         self._attr_device_info = hub.device_info(self._node, key.get("room"))
-        self._is_on = False
+        # None = unknown: not "off" until the box has actually reported it
+        self._is_on: bool | None = None
         self._boiler = key.get("boiler", False)
         hub.register_entity(self._node, self._key, self)
 

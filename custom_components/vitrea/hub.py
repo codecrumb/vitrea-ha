@@ -85,6 +85,10 @@ ADMIN_CACHE_VERSION = 1
 # silence means the node is done. Refreshing node by node, with gaps, keeps
 # the box free for commands (one full dump would block it for minutes).
 REFRESH_QUIET = 2.0
+# A command normally makes the box report the new state within ~0.3 s. If it
+# does not (the key was already in that state), re-read the node so the UI
+# can never stay on a stale value.
+VERIFY_DELAY = 1.5
 REFRESH_NODE_MAX = 20.0
 REFRESH_GAP = 1.0
 
@@ -185,6 +189,8 @@ class VitreaHub:
         self._poll_ticks = 0
         self._last_command = 0.0
         self._last_status = 0.0
+        self._key_push: dict[tuple[int, int], float] = {}
+        self._verify_tasks: dict[tuple[int, int], asyncio.Task] = {}
         self._force_rediscover = False
         self._just_discovered = False
         self._last_activity = time.monotonic()
@@ -222,6 +228,9 @@ class VitreaHub:
         self.hass.async_create_background_task(self._async_load(), "vitrea_load")
 
     async def async_unload(self) -> None:
+        for task in list(self._verify_tasks.values()):
+            task.cancel()
+        self._verify_tasks.clear()
         if self._poll_unsub is not None:
             self._poll_unsub()
             self._poll_unsub = None
@@ -810,6 +819,7 @@ class VitreaHub:
         if kind is None or kind == KIND_BUTTON:
             return  # momentary physical-key events, not state
         slot = (st.node, st.key)
+        self._key_push[slot] = time.monotonic()
         prev = self._states.get(slot)
         if kind == KIND_BLIND:
             ks = KeyState(False, st.position if st.position is not None else 0)
@@ -922,12 +932,33 @@ class VitreaHub:
     # ---------------------------------------------------------------
     # Commands
     # ---------------------------------------------------------------
-    async def _async_command(self, awaitable) -> None:
-        self._last_command = time.monotonic()
+    async def _async_command(self, awaitable, verify: tuple[int, int] | None = None) -> None:
+        issued = self._last_command = time.monotonic()
         try:
             await awaitable
         except VitreaError as err:
             raise HomeAssistantError(f"Vitrea V-Box: {err}") from err
+        if verify is not None:
+            old = self._verify_tasks.pop(verify, None)
+            if old is not None:
+                old.cancel()
+            self._verify_tasks[verify] = self.hass.async_create_background_task(
+                self._async_verify(verify, issued), "vitrea_verify"
+            )
+
+    async def _async_verify(self, slot: tuple[int, int], issued: float) -> None:
+        try:
+            await asyncio.sleep(VERIFY_DELAY)
+            if self._key_push.get(slot, 0.0) >= issued:
+                return  # the box reported the new state: nothing to correct
+            if self._simple is None or not self._simple.connected:
+                return
+            await self._simple.request_node(slot[0])
+        except VitreaError as err:
+            _LOGGER.debug("Vitrea: re-read of node %s failed: %s", slot[0], err)
+        finally:
+            if self._verify_tasks.get(slot) is asyncio.current_task():
+                self._verify_tasks.pop(slot, None)
 
     def _link(self) -> SimpleVBox:
         if self._simple is None:
@@ -939,21 +970,25 @@ class VitreaHub:
         # does that on the box.
         skey = self._simple_key(node, key)
         if ratio and ratio != 254:
-            await self._async_command(self._link().dimmer(node, skey, ratio))
+            await self._async_command(self._link().dimmer(node, skey, ratio), verify=(node, skey))
         else:
-            await self._async_command(self._link().key_on(node, skey))
+            await self._async_command(self._link().key_on(node, skey), verify=(node, skey))
 
     async def async_key_off(self, node: int, key, timer: int = 0) -> None:
-        await self._async_command(self._link().key_off(node, self._simple_key(node, key)))
+        skey = self._simple_key(node, key)
+        await self._async_command(self._link().key_off(node, skey), verify=(node, skey))
 
     async def async_boiler_on(self, node: int, key) -> None:
-        await self._async_command(self._link().key_on(node, self._simple_key(node, key)))
+        skey = self._simple_key(node, key)
+        await self._async_command(self._link().key_on(node, skey), verify=(node, skey))
 
     async def async_set_cover_position(self, node: int, key, ratio: int) -> None:
-        await self._async_command(self._link().blind_position(node, self._simple_key(node, key), ratio))
+        skey = self._simple_key(node, key)
+        await self._async_command(self._link().blind_position(node, skey, ratio), verify=(node, skey))
 
     async def async_stop_cover(self, node: int, key) -> None:
-        await self._async_command(self._link().blind_stop(node, self._simple_key(node, key)))
+        skey = self._simple_key(node, key)
+        await self._async_command(self._link().blind_stop(node, skey), verify=(node, skey))
 
     async def async_trigger_scenario(self, scenario_id: int) -> None:
         await self._async_command(self._link().scenario(scenario_id))
