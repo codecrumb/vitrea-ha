@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.0-beta.5
+- **Leftover keys are hidden.** Keys with no name, or only the vendor default (`N35-3`), control nothing and are
+  now left out on every naming path. New options in Configure: **Hide unnamed keys** (on by default; turn it off
+  to see them), **Hidden names** (wildcard patterns such as `spare*, *test`) and **Hidden nodes** (whole nodes by
+  number). Changing them reloads the integration.
+- **Setup asks for the admin login first** (optional; empty tries the vendor default `admin`/`admin`). A wrong
+  admin password is rejected at setup; a busy or unreachable admin port is not, and the other name sources are
+  used instead.
+- The suggested app (mobile) user is now `vitrea1` instead of `vitrea2`. Existing installs keep what they saved.
+
 ## 0.5.0-beta.4
 - Fix: a light that was already on could show as off after a (re)start and then ignore "on" (the box says
   nothing back when a key is already in the commanded state). Entities now show **unknown**, not off, until the
