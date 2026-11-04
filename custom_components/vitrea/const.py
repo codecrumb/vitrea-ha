@@ -24,6 +24,23 @@ DEFAULT_DISABLE_METADATA_CACHE = False
 CONF_EXCLUDED_KEYS = "excluded_keys"
 DEFAULT_EXCLUDED_KEYS = ""
 
+# Comma-separated node numbers to hide entirely (e.g. leftover example
+# nodes some installs still have). Unlike excluded_keys this takes plain
+# node numbers, so it works whatever naming source is in use.
+CONF_EXCLUDED_NODES = "excluded_nodes"
+DEFAULT_EXCLUDED_NODES = ""
+
+# Comma-separated name patterns (* and ? wildcards, case-insensitive) of
+# entities to hide, e.g. "N*-*, Spare*". Vendor default names (N35-3) are
+# always hidden without any setting.
+CONF_HIDDEN_NAMES = "hidden_names"
+DEFAULT_HIDDEN_NAMES = ""
+
+# On by default: keys the installer never named (empty, or the vendor default
+# such as N35-3) control nothing, so they are left out.
+CONF_HIDE_UNNAMED = "hide_unnamed"
+DEFAULT_HIDE_UNNAMED = True
+
 # Off by default: turning it on makes Home Assistant create an area per
 # V-Box room the first time it sees each node (HA applies a device's
 # suggested area only when the device is created).

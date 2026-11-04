@@ -15,6 +15,9 @@ from .const import (
     CONF_MOBILE_PASSWORD,
     CONF_DISABLE_METADATA_CACHE,
     CONF_EXCLUDED_KEYS,
+    CONF_EXCLUDED_NODES,
+    CONF_HIDDEN_NAMES,
+    CONF_HIDE_UNNAMED,
     CONF_USE_ROOMS_AS_AREAS,
     DEFAULT_ADMIN_PASSWORD,
     DEFAULT_ADMIN_USER,
@@ -22,6 +25,9 @@ from .const import (
     DEFAULT_MOBILE_USER,
     DEFAULT_DISABLE_METADATA_CACHE,
     DEFAULT_EXCLUDED_KEYS,
+    DEFAULT_EXCLUDED_NODES,
+    DEFAULT_HIDDEN_NAMES,
+    DEFAULT_HIDE_UNNAMED,
     DEFAULT_USE_ROOMS_AS_AREAS,
 )
 from ._mobile_client import MobileVBox, MobileVBoxAuthError
@@ -243,6 +249,18 @@ class VitreaOptionsFlow(config_entries.OptionsFlow):
             vol.Optional(
                 CONF_EXCLUDED_KEYS,
                 default=opts.get(CONF_EXCLUDED_KEYS, DEFAULT_EXCLUDED_KEYS),
+            ): str,
+            vol.Required(
+                CONF_HIDE_UNNAMED,
+                default=opts.get(CONF_HIDE_UNNAMED, DEFAULT_HIDE_UNNAMED),
+            ): bool,
+            vol.Optional(
+                CONF_EXCLUDED_NODES,
+                default=opts.get(CONF_EXCLUDED_NODES, DEFAULT_EXCLUDED_NODES),
+            ): str,
+            vol.Optional(
+                CONF_HIDDEN_NAMES,
+                default=opts.get(CONF_HIDDEN_NAMES, DEFAULT_HIDDEN_NAMES),
             ): str,
         })
         return self.async_show_form(step_id="init", data_schema=schema, errors=errors)

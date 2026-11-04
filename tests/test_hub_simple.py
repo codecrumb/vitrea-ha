@@ -186,6 +186,17 @@ def test_device_list_is_cached_and_excluded_keys_apply():
     run(go())
 
 
+def test_excluded_nodes_hide_whole_nodes():
+    async def go():
+        box = FakeBox()
+        await box.start()
+        h = await make(box, options={"excluded_nodes": "1, x,"})
+        assert {k["node"] for k in h.keys} == {2}
+        await h.async_unload()
+        await box.stop()
+    run(go())
+
+
 def test_status_mapping():
     async def go():
         box = FakeBox()
@@ -272,6 +283,79 @@ def test_mobile_names_only_attach_when_pairing_is_certain():
         # incompatible kinds: generic
         assert by[(9, "s1")]["ha_type"] == "switch" and (9, 0) not in by
         assert not any(k["node"] == 99 for k in out)
+        await h.async_unload()
+        await box.stop()
+    run(go())
+
+
+def test_vendor_default_names_are_hidden_after_pairing():
+    async def go():
+        box = FakeBox()
+        await box.start()
+        h = await make(box)
+        # node 7 has two real lights and two never-named installer leftovers;
+        # the box lists all four, so the names must still pair by count first.
+        mobile = [
+            _mk(7, 0, "light", "Hall"), _mk(7, 1, "light", "N7-K1"),
+            _mk(7, 2, "light", "N7-3"), _mk(7, 3, "light", "Porch"),
+        ]
+        raw = [_raw(7, 1, "O"), _raw(7, 2, "O"), _raw(7, 3, "O"), _raw(7, 4, "O")]
+        merged = h._merge_keys(mobile, raw)
+        assert [k["name"] for k in merged] == ["Hall", "N7-K1", "N7-3", "Porch"]
+        assert [k["name"] for k in merged if not h._is_hidden(k)] == ["Hall", "Porch"]
+        await h.async_unload()
+        await box.stop()
+    run(go())
+
+
+def test_admin_list_leftovers_are_hidden_unless_toggle_off():
+    data = {
+        "rooms": {"1": "Kitchen"}, "categories": {"1": "Light"}, "scenarios": [],
+        "nodes": {"35": {"node": 35, "room_no": 1, "num_keys": 3, "keys": [
+            {"node": 35, "key": 0, "class": 255, "category": 1, "room_no": 1, "name": "Lamp"},
+            {"node": 35, "key": 1, "class": 255, "category": 1, "room_no": 1, "name": "N35-3"},
+            {"node": 35, "key": 2, "class": 255, "category": 1, "room_no": 1, "name": ""},
+        ]}},
+    }
+    keys, _ = hub_mod.VitreaHub._keys_from_admin(data)
+    assert len(keys) == 3  # nothing is dropped before the user's setting applies
+
+    async def go():
+        box = FakeBox()
+        await box.start()
+        on = await make(box)
+        off = await make(box, options={"hide_unnamed": False})
+        assert [k["name"] for k in keys if not on._is_hidden(k)] == ["Lamp"]
+        assert len([k for k in keys if not off._is_hidden(k)]) == 3
+        await on.async_unload()
+        await off.async_unload()
+        await box.stop()
+    run(go())
+
+
+def test_hide_unnamed_can_be_turned_off():
+    async def go():
+        box = FakeBox()
+        await box.start()
+        h = await make(box, options={"hide_unnamed": False})
+        assert not h._is_hidden({"node": 1, "key": 0, "name": "N35-3"})
+        assert not h._is_hidden({"node": 1, "key": 0, "name": "x", "unnamed": True})
+        await h.async_unload()
+        await box.stop()
+    run(go())
+
+
+def test_hidden_names_patterns():
+    async def go():
+        box = FakeBox()
+        await box.start()
+        h = await make(box, options={"hidden_names": "spare*, *TEST"})
+        def key(name):
+            return {"node": 1, "key": 0, "name": name}
+        assert h._is_hidden(key("Spare bulb")) and h._is_hidden(key("my test"))
+        assert not h._is_hidden(key("Kitchen")) and not h._is_hidden(key("Node 1 key 3"))
+        assert h._is_hidden(key("n35-4"))  # vendor default, any case
+        assert h._is_hidden({"node": 1, "key": 1, "name": "Node 1 key 2", "unnamed": True})
         await h.async_unload()
         await box.stop()
     run(go())

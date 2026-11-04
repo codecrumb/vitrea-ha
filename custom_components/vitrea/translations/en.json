@@ -47,6 +47,9 @@
           "mobile_password": "Mobile password (optional)",
           "disable_metadata_cache": "Rescan device on every startup",
           "excluded_keys": "Excluded keys",
+          "hide_unnamed": "Hide unnamed keys",
+          "excluded_nodes": "Hidden nodes",
+          "hidden_names": "Hidden names",
           "use_rooms_as_areas": "Use V-Box rooms as areas"
         },
         "data_description": {
@@ -56,6 +59,9 @@
           "mobile_password": "Leave empty for generic \"Node N key K\" names.",
           "disable_metadata_cache": "Skip the device-list cache. Turn on, click Reload, then turn off again to force a one-off rescan.",
           "excluded_keys": "Comma-separated node:key pairs (0-indexed) to skip, e.g. 12:3,40:0",
+          "hide_unnamed": "Leave out keys with no name or only the vendor default (for example N35-3). They usually control nothing.",
+          "excluded_nodes": "Comma-separated node numbers to hide completely, e.g. leftover example nodes: 90,91",
+          "hidden_names": "Comma-separated names to hide; * and ? wildcards, e.g. Spare*, *test. Use the Hide unnamed keys option for vendor defaults such as N35-3.",
           "use_rooms_as_areas": "Put each node's device in the area named after its V-Box room (existing areas of the same name are reused, others are created). Never overrides an area you set yourself."
         }
       }

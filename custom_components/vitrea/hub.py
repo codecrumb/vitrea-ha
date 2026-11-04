@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import fnmatch
 import logging
 import re
 import threading
@@ -34,6 +35,9 @@ from .const import (
     CONF_MOBILE_USER,
     CONF_DISABLE_METADATA_CACHE,
     CONF_EXCLUDED_KEYS,
+    CONF_EXCLUDED_NODES,
+    CONF_HIDDEN_NAMES,
+    CONF_HIDE_UNNAMED,
     CONF_SIMPLE_PORT,
     CONF_USE_ROOMS_AS_AREAS,
     DEFAULT_ADMIN_PASSWORD,
@@ -41,6 +45,9 @@ from .const import (
     DEFAULT_ADMIN_USER,
     DEFAULT_DISABLE_METADATA_CACHE,
     DEFAULT_EXCLUDED_KEYS,
+    DEFAULT_EXCLUDED_NODES,
+    DEFAULT_HIDDEN_NAMES,
+    DEFAULT_HIDE_UNNAMED,
     DEFAULT_MOBILE_PORT,
     DEFAULT_MOBILE_USER,
     DEFAULT_USE_ROOMS_AS_AREAS,
@@ -101,7 +108,7 @@ _ICON_HA: dict[str, str] = {
     "Boiler": "switch", "Undefined": "switch", "Scenario": "switch",
     "Audio": "switch", "TV": "switch", "Alarm": "switch",
 }
-_DEFAULT_KEY_NAME = re.compile(r"^N\d+-\d+$")
+_DEFAULT_KEY_NAME = re.compile(r"^N\d+-K?\d+$", re.IGNORECASE)
 METADATA_PACE = 0.1
 METADATA_RELOGIN_EVERY = 60
 
@@ -126,6 +133,25 @@ def _parse_excluded_keys(raw: str) -> set[tuple[int, int | str]]:
         except ValueError:
             _LOGGER.warning("Vitrea: ignoring malformed excluded_keys entry %r", part)
     return out
+
+
+def _parse_excluded_nodes(raw: str) -> set[int]:
+    """Parse the `excluded_nodes` option: "12,40", whole nodes to hide."""
+    out: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.add(int(part))
+        except ValueError:
+            _LOGGER.warning("Vitrea: ignoring malformed excluded_nodes entry %r", part)
+    return out
+
+
+def _parse_hidden_names(raw: str) -> list[str]:
+    """Parse the `hidden_names` option into lowercase wildcard patterns."""
+    return [p.strip().lower() for p in raw.split(",") if p.strip()]
 
 
 class KeyState(NamedTuple):
@@ -165,6 +191,13 @@ class VitreaHub:
         )
         self._excluded_keys = _parse_excluded_keys(
             options.get(CONF_EXCLUDED_KEYS, DEFAULT_EXCLUDED_KEYS)
+        )
+        self._excluded_nodes = _parse_excluded_nodes(
+            options.get(CONF_EXCLUDED_NODES, DEFAULT_EXCLUDED_NODES)
+        )
+        self._hide_unnamed = options.get(CONF_HIDE_UNNAMED, DEFAULT_HIDE_UNNAMED)
+        self._hidden_names = _parse_hidden_names(
+            options.get(CONF_HIDDEN_NAMES, DEFAULT_HIDDEN_NAMES)
         )
         self.keys: list[dict] = []
         self.scenarios: list[dict] = []
@@ -283,7 +316,7 @@ class VitreaHub:
                 if attempt < 2:
                     await asyncio.sleep(30)
             keys = self._merge_keys(mobile, raw)
-        keys = [k for k in keys if (k["node"], k["key"]) not in self._excluded_keys]
+        keys = [k for k in keys if not self._is_hidden(k)]
         self.keys, self.scenarios = keys, scenarios
         self._skey = {(k["node"], k["key"]): k["simple_key"] for k in keys}
         try:
@@ -369,7 +402,7 @@ class VitreaHub:
                     rank += 1
                 name = (k.get("name") or "").strip()
                 lname = name.lower()
-                if lname.endswith("mw") or " pair" in lname or _DEFAULT_KEY_NAME.match(name):
+                if lname.endswith("mw") or " pair" in lname:
                     continue
                 icon = icons.get(k["category"], "Undefined")
                 ha_type = _ICON_HA.get(icon)
@@ -381,6 +414,7 @@ class VitreaHub:
                     "key": rank if k["class"] == CLASS_PHYSICAL else f"s{skey}",
                     "simple_key": skey,
                     "name": name or f"Node {node} key {skey}",
+                    "unnamed": not name,
                     "ha_type": ha_type,
                     "dimmable": icon == "Dimmer",
                     "room": rooms.get(k["room_no"]) or rooms.get(nd.get("room_no"), ""),
@@ -390,6 +424,22 @@ class VitreaHub:
             for sc in data.get("scenarios", [])
         ]
         return keys, scenarios
+
+    def _is_hidden(self, k: dict) -> bool:
+        """Keys the user (or the vendor's leftovers) keep out of HA.
+
+        Vendor default names (N35-3) mark keys an installer never named and
+        that control nothing (the "Hide unnamed keys" option). They are dropped only here, after the mobile
+        names are paired with the simple-protocol dump, because that
+        pairing needs the node's full key count.
+        """
+        if (k["node"], k["key"]) in self._excluded_keys or k["node"] in self._excluded_nodes:
+            return True
+        name = (k.get("name") or "").strip()
+        if self._hide_unnamed and (k.get("unnamed") or not name or _DEFAULT_KEY_NAME.match(name)):
+            return True
+        lname = name.lower()
+        return any(fnmatch.fnmatchcase(lname, p) for p in self._hidden_names)
 
     async def _async_mobile_metadata(self) -> tuple[list[dict], list[dict]]:
         # The full scan only needs to run when the controller's config
