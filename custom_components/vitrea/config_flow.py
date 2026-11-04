@@ -30,6 +30,7 @@ from .const import (
     DEFAULT_HIDE_UNNAMED,
     DEFAULT_USE_ROOMS_AS_AREAS,
 )
+from ._admin_client import AdminAuthError, AdminVBox
 from ._mobile_client import MobileVBox, MobileVBoxAuthError
 from ._simple_client import DEFAULT_PORT as SIMPLE_PORT, probe, scan
 
@@ -49,6 +50,12 @@ def _try_mobile_login(data: dict) -> None:
         m.login()
     finally:
         m.close()
+
+
+def _try_admin_login(host: str, user: str, password: str) -> None:
+    """Log in once over the admin port; always releases the session."""
+    with AdminVBox(host, user=user, password=password):
+        pass
 
 
 async def _async_local_networks(hass) -> list[str]:
@@ -136,6 +143,8 @@ class VitreaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         defaults = user_input or {}
         schema = vol.Schema({
             vol.Optional("host", default=defaults.get("host", "")): str,
+            vol.Optional(CONF_ADMIN_USER, default=defaults.get(CONF_ADMIN_USER, DEFAULT_ADMIN_USER)): str,
+            vol.Optional(CONF_ADMIN_PASSWORD, default=defaults.get(CONF_ADMIN_PASSWORD, "")): str,
             vol.Optional(CONF_MOBILE_USER, default=defaults.get(CONF_MOBILE_USER, DEFAULT_MOBILE_USER)): str,
             vol.Optional(CONF_MOBILE_PASSWORD, default=defaults.get(CONF_MOBILE_PASSWORD, "")): str,
         })
@@ -166,6 +175,22 @@ class VitreaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             CONF_MOBILE_USER: user_input.get(CONF_MOBILE_USER) or DEFAULT_MOBILE_USER,
             CONF_MOBILE_PASSWORD: user_input.get(CONF_MOBILE_PASSWORD) or "",
         }
+        admin_password = user_input.get(CONF_ADMIN_PASSWORD) or ""
+        if admin_password:
+            # Only a rejected password stops setup. A busy admin session
+            # (Control4 holds it) or an unreachable admin port cannot be
+            # told apart from a good password, and the integration falls
+            # back to the other name sources on its own.
+            admin_user = user_input.get(CONF_ADMIN_USER) or DEFAULT_ADMIN_USER
+            try:
+                await self.hass.async_add_executor_job(_try_admin_login, host, admin_user, admin_password)
+            except AdminAuthError:
+                errors["base"] = "invalid_admin_auth"
+                return None
+            except Exception:
+                _LOGGER.debug("Vitrea: admin login not verified at setup", exc_info=True)
+            data[CONF_ADMIN_USER] = admin_user
+            data[CONF_ADMIN_PASSWORD] = admin_password
         if data[CONF_MOBILE_PASSWORD]:
             try:
                 await self.hass.async_add_executor_job(_try_mobile_login, data)

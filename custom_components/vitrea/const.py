@@ -12,7 +12,7 @@ DEFAULT_ADMIN_PORT = 11501
 DEFAULT_ADMIN_USER = "admin"
 DEFAULT_ADMIN_PASSWORD = "admin"
 DEFAULT_MOBILE_PORT = 11503
-DEFAULT_MOBILE_USER = "vitrea2"
+DEFAULT_MOBILE_USER = "vitrea1"
 
 # Options (not config data): changing these reloads the entry.
 CONF_DISABLE_METADATA_CACHE = "disable_metadata_cache"
