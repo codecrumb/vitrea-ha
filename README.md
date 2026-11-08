@@ -51,9 +51,14 @@ down.
 
 ### Via HACS (recommended)
 
-1. HACS → the ⋮ menu → **Custom repositories** → add
-   `https://github.com/codecrumb/vitrea-ha`, category **Integration**.
-2. Install **Vitrea V-Box** from HACS, then restart Home Assistant.
+Vitrea V-Box is in the HACS default store, so no custom repository is needed:
+
+1. HACS → search for **Vitrea V-Box** → **Download**.
+2. Restart Home Assistant.
+
+If HACS doesn't list it yet (an old HACS version or a stale cache), update HACS
+or add the repo by hand: HACS → the ⋮ menu → **Custom repositories** → add
+`https://github.com/codecrumb/vitrea-ha`, category **Integration**.
 
 ### Manually
 
